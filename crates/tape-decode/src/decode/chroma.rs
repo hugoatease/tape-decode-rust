@@ -141,12 +141,30 @@ fn comb_c(data: &mut [f32], line_len: usize, line_distance: usize) {
     }
 }
 
+// SECAM's native path is already scaled to +-CHROMA_SCALE in `demod_secam_chroma`,
+// not burst-relative, so it uses a flat packing instead of `acc()`'s
+// burst-referenced AGC.
+fn pack_secam_u16(native: &[f32]) -> Vec<u16> {
+    const SIGNED_SAMPLE_MAX: f32 = 32767.0;
+    native
+        .iter()
+        .map(|&sample| (sample.mul_add(1.0, SIGNED_SAMPLE_MAX) as i64) as u16)
+        .collect()
+}
+
 fn process_chroma_internal(
     field: &mut DecodedField,
     spec: &DecoderSpec,
     chroma_afc_state: &mut ChromaAfcState,
+    secam_state: &mut SecamChromaState,
 ) -> Result<Vec<u16>> {
     let chroma_downscaled = downscale_raw_vec(field, None, None, None, true)?;
+
+    if spec.decoder_secam_native_fm_chroma {
+        let native = demod_secam_chroma(field, spec, secam_state, &chroma_downscaled)?;
+        return Ok(pack_secam_u16(&native));
+    }
+
     let mut chroma: Vec<f32> = if spec.chroma_afc_enabled() {
         let bandpass = chroma_afc_state.get_chroma_bandpass(spec)?;
         let chroma_len = chroma_downscaled.len();
@@ -210,10 +228,11 @@ pub(crate) fn decode_chroma(
     field: &mut DecodedField,
     spec: &DecoderSpec,
     chroma_afc_state: &mut ChromaAfcState,
+    secam_state: &mut SecamChromaState,
 ) -> Result<Option<Vec<u16>>> {
     if !spec.rf_write_chroma || spec.color_system == ColorSystem::Monochrome {
         return Ok(None);
     }
-    let upconverted = process_chroma_internal(field, spec, chroma_afc_state)?;
+    let upconverted = process_chroma_internal(field, spec, chroma_afc_state, secam_state)?;
     Ok(Some(upconverted))
 }

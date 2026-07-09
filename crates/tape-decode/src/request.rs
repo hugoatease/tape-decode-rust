@@ -164,6 +164,11 @@ pub struct DecoderParams {
     /// during upconversion. Has no effect on monochrome profiles.
     #[serde(default)]
     pub chroma_deemphasis_enabled: bool,
+    /// Route this profile's chroma through the native SECAM FM discriminator
+    /// (real ÷4-carrier SECAM VHS) instead of the heterodyne/mixing path used
+    /// by PAL/NTSC/MESECAM. Has no effect unless `color_system == Secam`.
+    #[serde(default)]
+    pub secam_native_fm_chroma: bool,
     pub chroma_bpf_upper: f64,
     pub chroma_bpf_order: usize,
     pub chroma_bpf_lower: f64,

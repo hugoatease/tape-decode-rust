@@ -113,6 +113,11 @@ pub struct DecoderSpec {
     pub(crate) chroma_filter_audio_notch: Option<Vec<Sos<f32>>>,
     pub(crate) chroma_filter_final: Vec<Sos<f32>>,
 
+    pub(crate) decoder_secam_native_fm_chroma: bool,
+    pub(crate) secam_chroma_bandpass: Vec<Sos<f32>>,
+    pub(crate) secam_chroma_post_lpf: Vec<Sos<f32>>,
+    pub(crate) secam_chroma_deemphasis: Vec<Sos<f32>>,
+
     pub(crate) video_rf_filter: Vec<f32>,
     pub(crate) video_notch_filter: Option<Vec<f32>>,
     pub(crate) video_env_post_filter: Vec<Sos<f32>>,
@@ -527,6 +532,47 @@ impl DecoderSpec {
 
         // Post-TBC chroma filter at output sample rate (4fsc).
         let chroma_filter_final = chroma_bandpass_final(is_color_under)?;
+
+        // Native SECAM FM-chroma path: these filters run at the TBC output rate
+        // (`sys_outfreq`), not the RF input rate, since the native decoder operates
+        // on `chroma_downscaled` (already post-TBC), unlike `chroma_filter_video_burst`
+        // above which runs on the raw RF stream.
+        let secam_native_fm_chroma = decoder_params.secam_native_fm_chroma;
+        let (secam_chroma_bandpass, secam_chroma_post_lpf, secam_chroma_deemphasis) =
+            if secam_native_fm_chroma {
+                use crate::decode::secam::{
+                    POST_LPF_HZ, POST_LPF_ORDER, PREEMPH_F1_HZ, PREEMPH_F2_HZ, UNDER_BPF_HZ,
+                    UNDER_BPF_ORDER,
+                };
+                let secam_nyquist_hz = sys_params.outfreq * 1e6 / 2.0;
+                let bandpass = store_sos_filter(butter_sos(
+                    UNDER_BPF_ORDER,
+                    &[
+                        UNDER_BPF_HZ.0 / secam_nyquist_hz,
+                        UNDER_BPF_HZ.1 / secam_nyquist_hz,
+                    ],
+                    FilterBandType::Bandpass,
+                )?);
+                let post_lpf = store_sos_filter(butter_sos(
+                    POST_LPF_ORDER,
+                    &[POST_LPF_HZ / secam_nyquist_hz],
+                    FilterBandType::Lowpass,
+                )?);
+                // Inverse of SECAM's Dr/Db pre-emphasis shelf P(s) = (1+s/w1)/(1+s/w2).
+                let w1 = 2.0 * std::f64::consts::PI * PREEMPH_F1_HZ;
+                let w2 = 2.0 * std::f64::consts::PI * PREEMPH_F2_HZ;
+                let (mut b, mut a) =
+                    bilinear(&[1.0 / w2, 1.0], &[1.0 / w1, 1.0], sys_params.outfreq * 1e6);
+                // bilinear() returns a first-order (len-2) filter; biquad_sos_vec
+                // expects triplets, so pad with a trailing zero coefficient.
+                b.push(0.0);
+                a.push(0.0);
+                let deemph_sos = store_sos_filter(biquad_sos_vec((b, a)));
+                (bandpass, post_lpf, deemph_sos)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+
         let (rf_chroma_heterodyne, rf_fsc_wave) = if is_color_under {
             let cc_freq_mhz = color_under / 1e6;
             let het_freq = sys_params.fsc_mhz + cc_freq_mhz;
@@ -619,6 +665,11 @@ impl DecoderSpec {
             sys_burst_abs_ref: sys_params.burst_abs_ref,
             sys_track_ire0_offset: sys_params.track_ire0_offset,
             sys_nonlinear_deviation: sys_params.nonlinear_deviation,
+
+            decoder_secam_native_fm_chroma: secam_native_fm_chroma,
+            secam_chroma_bandpass,
+            secam_chroma_post_lpf,
+            secam_chroma_deemphasis,
 
             decoder_color_under_carrier: decoder_params.color_under_carrier,
             decoder_chroma_bpf_upper: decoder_params.chroma_bpf_upper,

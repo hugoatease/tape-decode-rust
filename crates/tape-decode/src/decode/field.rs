@@ -768,6 +768,7 @@ pub(crate) fn predecode_field_from_rawdecode(
         phase_sequence: None,
         burst_phase_avg: None,
         wow_analysis: None,
+        secam_first_line_is_red: None,
     };
     if let Some(prevfield) = &pending_field.prevfield {
         if pending_field.readloc > prevfield.readloc {

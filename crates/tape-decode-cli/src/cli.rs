@@ -734,6 +734,15 @@ impl JsonDiff {
             (None, Some(_)) => self.record(format!("{path}: unexpected key")),
         }
     }
+
+    fn opt_bool(&mut self, path: &str, expected: Option<bool>, actual: Option<bool>) {
+        match (expected, actual) {
+            (Some(e), Some(a)) => self.bool(path, e, a),
+            (None, None) => {}
+            (Some(_), None) => self.record(format!("{path}: missing key")),
+            (None, Some(_)) => self.record(format!("{path}: unexpected key")),
+        }
+    }
 }
 
 /// Flatten per-line dropout segments into merged, contiguous sample intervals in
@@ -908,6 +917,11 @@ fn compare_field(expected: &FieldInfoEntry, actual: &FieldInfoEntry, index: usiz
     diff.opt_float(&format!("{p}.vitsMetrics.wSNR"), expected.vits_metrics.w_snr, actual.vits_metrics.w_snr);
     diff.opt_float(&format!("{p}.vitsMetrics.bPSNR"), expected.vits_metrics.b_psnr, actual.vits_metrics.b_psnr);
     diff.opt_int(&format!("{p}.decodeFaults"), expected.decode_faults, actual.decode_faults);
+    diff.opt_bool(
+        &format!("{p}.secamFirstLineIsRed"),
+        expected.secam_first_line_is_red,
+        actual.secam_first_line_is_red,
+    );
     // Dropouts are not written if there isn't any, but an empty one may still match within
     // tolerance to a non-empty one, so we treat missing `dropOuts` as empty.
     let empty_dropouts = DropOuts {

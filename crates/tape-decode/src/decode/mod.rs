@@ -20,6 +20,7 @@ mod chroma;
 mod demodblock;
 mod dropouts;
 mod field;
+pub(crate) mod secam;
 mod sync;
 mod vits;
 
@@ -27,6 +28,7 @@ use chroma::decode_chroma;
 use demodblock::decode_video_block;
 use dropouts::detect_dropouts_rf;
 use field::predecode_field_from_rawdecode;
+use secam::{demod_secam_chroma, SecamChromaState};
 use sync::ResyncState;
 use vits::compute_vits_metrics;
 
@@ -631,6 +633,8 @@ pub struct FieldInfoEntry {
     pub drop_outs: Option<DropOuts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_faults: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secam_first_line_is_red: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -900,6 +904,9 @@ struct DecodedField {
     /// depend only on the line-location spline, so they are identical for every
     /// channel; `downscale_raw_vec` fills this on the first call and reuses it.
     wow_analysis: Option<(f64, f64)>,
+    /// Set by the native SECAM chroma decoder only; `None` for every other
+    /// colour system.
+    secam_first_line_is_red: Option<bool>,
 }
 
 struct DecodeFieldResult {
@@ -1219,6 +1226,7 @@ pub struct Decoder {
     inter_field_state: InterFieldState,
     resync_state: ResyncState,
     chroma_afc_state: ChromaAfcState,
+    secam_state: SecamChromaState,
     fields: Vec<FieldInfoEntry>,
     seen_first_field: bool,
     metadata_field: Option<MetadataFieldState>,
@@ -1233,6 +1241,7 @@ impl Decoder {
         let inter_field_state = InterFieldState::new(spec.track_phase);
         let resync_state = ResyncState::new(&spec);
         let chroma_afc_state = ChromaAfcState::new(&spec);
+        let secam_state = SecamChromaState::default();
         Self {
             spec,
             fdoffset,
@@ -1240,6 +1249,7 @@ impl Decoder {
             inter_field_state,
             resync_state,
             chroma_afc_state,
+            secam_state,
             fields: Vec::new(),
             seen_first_field: false,
             metadata_field: None,
@@ -1421,8 +1431,12 @@ impl Decoder {
                             outlinecount: field_obj.outlinecount,
                         });
 
-                        picture_chroma =
-                            decode_chroma(&mut field_obj, &self.spec, &mut self.chroma_afc_state)?;
+                        picture_chroma = decode_chroma(
+                            &mut field_obj,
+                            &self.spec,
+                            &mut self.chroma_afc_state,
+                            &mut self.secam_state,
+                        )?;
 
                         field_obj.prevfield = None;
                         field_done = true;
@@ -1561,6 +1575,7 @@ impl Decoder {
                     vits_metrics,
                     drop_outs,
                     decode_faults: (decode_faults != 0).then_some(decode_faults),
+                    secam_first_line_is_red: field_obj.secam_first_line_is_red,
                 };
 
                 // Slot fields by their detected order so the duplicate path can pair
@@ -1610,6 +1625,8 @@ impl Decoder {
         let system = match (spec.sys_frame_lines, spec.color_system) {
             (LineSystem::Line525, ColorSystem::Pal) => "PAL-M",
             (LineSystem::Line525, _) => "NTSC",
+            (_, ColorSystem::Secam) if spec.decoder_secam_native_fm_chroma => "SECAM",
+            (_, ColorSystem::Secam) => "MESECAM",
             _ => "PAL",
         };
         Some(DecoderMetadata {
