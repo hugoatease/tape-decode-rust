@@ -51,6 +51,7 @@ impl SecamChromaState {
 
 fn classify_lines(
     freq_by_line: &[f32],
+    amp_by_line: &[f32],
     linesout: usize,
     outwidth: usize,
     sample_rate_hz: f64,
@@ -68,18 +69,50 @@ fn classify_lines(
         })
         .collect();
 
+    // Amplitude median per line, over the same window, to exclude line pairs
+    // where the carrier is too weak to trust from the vote — the same weak
+    // regions `conceal_weak_samples` already masks out of the chroma output.
+    // Without this, a near-noise-floor carrier makes the frequency median
+    // essentially random, which can flip the vote across a 50/50 boundary
+    // between independently-started decoders on the same physical field
+    // (e.g. two multithreaded-decode workers), producing a categorical
+    // red/blue swap since RED_COEFF/BLUE_COEFF have opposite signs.
+    let mut amp_scratch = vec![0.0f32; active_hi - active_lo];
+    let row_amp: Vec<f32> = (0..linesout)
+        .map(|line| {
+            let start = line * outwidth + active_lo;
+            amp_scratch.copy_from_slice(&amp_by_line[start..start + (active_hi - active_lo)]);
+            median_from_values(&mut amp_scratch)
+        })
+        .collect();
+    let mut global_amp_scratch = row_amp.clone();
+    let amp_threshold = AMP_KILL_RATIO * median_from_values(&mut global_amp_scratch);
+
     // VOTE_ROW_RANGE.0 is even by construction (20).
     let vote_hi = VOTE_ROW_RANGE.1.min(linesout.saturating_sub(1));
-    let mut positive = 0usize;
-    let mut total = 0usize;
-    let mut k = VOTE_ROW_RANGE.0;
-    while k + 1 < vote_hi {
-        if row_median[k + 1] - row_median[k] > 0.0 {
-            positive += 1;
+    let vote = |require_amp: bool| -> (usize, usize) {
+        let mut positive = 0usize;
+        let mut total = 0usize;
+        let mut k = VOTE_ROW_RANGE.0;
+        while k + 1 < vote_hi {
+            let strong = row_amp[k] >= amp_threshold && row_amp[k + 1] >= amp_threshold;
+            if !require_amp || strong {
+                if row_median[k + 1] - row_median[k] > 0.0 {
+                    positive += 1;
+                }
+                total += 1;
+            }
+            k += 2;
         }
-        total += 1;
-        k += 2;
-    }
+        (positive, total)
+    };
+    // Prefer the amplitude-gated vote; fall back to the ungated one if every
+    // pair in the window was too weak to trust, so a field is never left
+    // fully unvoted.
+    let (positive, total) = match vote(true) {
+        (_, 0) => vote(false),
+        result => result,
+    };
     let odd_is_red_fraction = if total > 0 {
         positive as f64 / total as f64
     } else {
@@ -201,7 +234,8 @@ pub(super) fn demod_secam_chroma(
     }
 
     // Classify red/blue lines.
-    let (is_red_line, offset) = classify_lines(&freq_by_line, linesout, outwidth, sample_rate_hz);
+    let (is_red_line, offset) =
+        classify_lines(&freq_by_line, &amp_by_line, linesout, outwidth, sample_rate_hz);
     field.secam_first_line_is_red = is_red_line.first().copied();
 
     // Deviation from each line's own rest carrier.
