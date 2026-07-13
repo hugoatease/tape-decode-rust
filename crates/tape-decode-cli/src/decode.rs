@@ -711,6 +711,7 @@ impl<'a> MtOrchestrator<'a> {
             // consecutive fields match (stitch) or the window is exhausted.
             let mut run = 0usize;
             let mut stitched = false;
+            let mut window_had_fields = false;
             loop {
                 let in_window = match self.pool.get_mut(&current_seg).unwrap().peek() {
                     Some(field) => field.info.file_loc < region_end,
@@ -722,6 +723,7 @@ impl<'a> MtOrchestrator<'a> {
                 if !in_window {
                     break;
                 }
+                window_had_fields = true;
                 let field = self.pool.get_mut(&current_seg).unwrap().pop().unwrap();
                 let matched = self.compare_with_next(next_seg, &field);
                 self.commit(field)?;
@@ -734,6 +736,44 @@ impl<'a> MtOrchestrator<'a> {
                 } else {
                     run = 0;
                 }
+            }
+
+            if !stitched && !window_had_fields {
+                // The current decoder produced no field anywhere inside `next`'s
+                // region: unrecorded tape or a long unsyncable stretch. Stepping
+                // one region at a time would spawn a worker into every field-less
+                // region only to discard it (and force the shared tape to buffer
+                // the whole stretch while they lag behind); instead, jump the
+                // stitch point straight to the region holding the current
+                // decoder's next real field and drop the stale workers between.
+                let next_loc = self
+                    .pool
+                    .get_mut(&current_seg)
+                    .unwrap()
+                    .peek()
+                    .map(|field| field.info.file_loc)
+                    .expect("phase 2 exits with a buffered field when not at end of input");
+                let region_len = self.mt.distance_size.saturating_mul(self.spf).max(1);
+                let target_seg = (next_loc.saturating_sub(self.global_base) / region_len)
+                    .max(next_seg.saturating_add(1));
+                tracing::info!(
+                    next_field_sample = next_loc,
+                    skipped_regions = target_seg - next_seg,
+                    "No fields decoded inside the next thread's region; jumping the stitch point past the field-less stretch"
+                );
+                let stale: Vec<u64> = self
+                    .pool
+                    .keys()
+                    .copied()
+                    .filter(|&seg| seg > current_seg && seg < target_seg)
+                    .collect();
+                for seg in stale {
+                    self.shutdown_worker(seg);
+                }
+                self.next_unassigned = self.next_unassigned.max(target_seg);
+                next_seg = target_seg;
+                self.refill()?;
+                continue;
             }
 
             if stitched {
