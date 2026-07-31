@@ -313,14 +313,23 @@ pub fn scan_file(
         buffer: vec![0.0; window],
     };
 
+    tracing::info!("locating end of capture (probing forward from a 60s guess)...");
     let capture_end = prober.find_capture_end()?;
     let stride = (params.stride_secs * fs) as u64;
     let stride = stride.max(window as u64);
+    let probe_count = (capture_end / stride) + 1;
+    tracing::info!(
+        "scanning {} of tape ({probe_count} probes at {:.1}s stride)",
+        format_tape_time(capture_end, fs),
+        params.stride_secs,
+    );
 
     // Coarse classification on the grid, with hysteresis.
     let mut grid: Vec<(u64, bool)> = Vec::new();
     let mut state: Option<bool> = None;
     let mut position = 0u64;
+    let scan_start = std::time::Instant::now();
+    let mut last_report = scan_start;
     while position + window as u64 <= capture_end {
         if let Some(contrast) = prober.contrast_at(position) {
             let is_signal = match state {
@@ -332,6 +341,25 @@ pub fn scan_file(
             grid.push((position, is_signal));
         }
         position += stride;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_report).as_secs_f64() >= 5.0 {
+            last_report = now;
+            let fraction = position as f64 / capture_end as f64;
+            let elapsed = now.duration_since(scan_start).as_secs_f64();
+            let eta_secs = if fraction > 0.0 {
+                elapsed / fraction - elapsed
+            } else {
+                f64::NAN
+            };
+            tracing::info!(
+                "scanning: {} / {} ({:.1}%), elapsed {:.0}s, eta {:.0}s",
+                format_tape_time(position, fs),
+                format_tape_time(capture_end, fs),
+                fraction * 100.0,
+                elapsed,
+                eta_secs,
+            );
+        }
     }
     if grid.is_empty() {
         bail!("capture too short to scan");
