@@ -234,8 +234,13 @@ pub(super) fn demod_secam_chroma(
     }
 
     // Classify red/blue lines.
-    let (is_red_line, offset) =
-        classify_lines(&freq_by_line, &amp_by_line, linesout, outwidth, sample_rate_hz);
+    let (is_red_line, offset) = classify_lines(
+        &freq_by_line,
+        &amp_by_line,
+        linesout,
+        outwidth,
+        sample_rate_hz,
+    );
     field.secam_first_line_is_red = is_red_line.first().copied();
 
     // Deviation from each line's own rest carrier.
@@ -289,7 +294,12 @@ pub(super) fn demod_secam_chroma(
     }
 
     conceal_weak_samples(&mut native, &amp_by_line, &is_red_line, linesout, outwidth);
-    temporal_nr(&mut native, state, field.is_first_field.unwrap_or(false), offset);
+    temporal_nr(
+        &mut native,
+        state,
+        field.is_first_field.unwrap_or(false),
+        offset,
+    );
 
     for n in &mut native {
         *n *= CHROMA_SCALE;
