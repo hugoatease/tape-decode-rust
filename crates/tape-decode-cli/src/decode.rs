@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tape_decode::{Decoder, DecoderMetadata, DecoderSpec, LumaOutput, WriteableField, BLOCKSIZE};
 
-use crate::reader::DecodeReader;
 use crate::writer::DecodeWriter;
+use tape_rf_io::DecodeReader;
 
 /// Decode the whole input serially. Like the multithreaded path, the input is
 /// streamed once from the stream start and the decoder skips past everything

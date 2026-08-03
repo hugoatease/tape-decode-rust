@@ -6,7 +6,7 @@ const SOSFILTFILT_STACK_MAX_SECTIONS: usize = 12;
 /// Narrow a designed SOS cascade to the representation used by the filter
 /// runtime here. Only the coefficients are carried; the steady-state delay
 /// values are re-derived at filter-run time.
-pub(crate) fn narrow_sos(sos: &[Sos<f64>]) -> Vec<Sos<f32>> {
+pub fn narrow_sos(sos: &[Sos<f64>]) -> Vec<Sos<f32>> {
     sos.iter()
         .map(|section| {
             Sos::new(
@@ -25,7 +25,7 @@ pub(crate) fn narrow_sos(sos: &[Sos<f64>]) -> Vec<Sos<f32>> {
         .collect()
 }
 
-pub(crate) fn sosfiltfilt_f32(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
+pub fn sosfiltfilt_f32(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
     #[cfg(nightly_portable_simd)]
     if sos.len() == 1 && sos[0].b[2] == 0.0 && sos[0].a[2] == 0.0 {
         return sosfiltfilt_order1_scan_f32(&sos[0], input_array);
@@ -535,7 +535,7 @@ fn sosfilt_sample_slice(mut sample: f32, sections: &mut [Sos<f32>]) -> f32 {
 /// Unlike `sosfiltfilt_f32` this is a single forward pass — no boundary padding
 /// and no forward/backward symmetry — so it keeps the filter's phase response
 /// instead of zeroing it.
-pub(crate) fn sosfilt_f32(sos: &[Sos<f32>], input: &[f32]) -> Vec<f32> {
+pub fn sosfilt_f32(sos: &[Sos<f32>], input: &[f32]) -> Vec<f32> {
     match sos.len() {
         1 => sosfilt_stack::<1>(sos, input),
         2 => sosfilt_stack::<2>(sos, input),

@@ -59,7 +59,7 @@ fn unwrap_more(a: &[Complex32; 8], b: &[Complex32; 8], out: &mut [f32; 8], freq:
 }
 
 #[inline(never)]
-pub(crate) fn unwrap_angles(
+pub fn unwrap_angles(
     input_slice: &[Complex32],
     output_slice: &mut [f32],
     freq: f32,

@@ -2,6 +2,8 @@
 members = [
     "crates/tape-decode",
     "crates/tape-decode-cli",
+    "crates/tape-dsp",
+    "crates/tape-rf-io",
 ]
 resolver = "2"
 

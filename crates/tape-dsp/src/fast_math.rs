@@ -6,7 +6,7 @@
 /// expressing the lanes through reassociation-licensed adds let the compiler
 /// legally fold them back into a serial chain, which it did.
 #[inline]
-pub(crate) fn sum_algebraic(values: &[f32]) -> f32 {
+pub fn sum_algebraic(values: &[f32]) -> f32 {
     const LANES: usize = 16;
     let mut chunks = values.chunks_exact(LANES);
     let lanes_total: f32 = {
@@ -60,7 +60,7 @@ fn exp2_fast(y: f32) -> f32 {
 /// normal range; subnormal `x` (including zero) comes out as a tiny positive
 /// value rather than exactly `x.powf(c)`.
 #[inline(always)]
-pub(crate) fn powf_fast_nonneg(x: f32, c: f32) -> f32 {
+pub fn powf_fast_nonneg(x: f32, c: f32) -> f32 {
     // log2(x): reduce to m in [sqrt(2)/2, sqrt(2)) with integer exponent e.
     let bits = x.to_bits();
     const SQRT2_BITS: u32 = 0x3FB5_04F3;
@@ -88,7 +88,7 @@ pub(crate) fn powf_fast_nonneg(x: f32, c: f32) -> f32 {
 /// as ~2^127 or ~2^-126 rather than infinity or zero; relative error stays
 /// within a few ulp in between.
 #[inline(always)]
-pub(crate) fn exp_fast(z: f32) -> f32 {
+pub fn exp_fast(z: f32) -> f32 {
     const LOG2_E: f32 = core::f32::consts::LOG2_E;
     exp2_fast((z * LOG2_E).clamp(-126.0, 127.0))
 }

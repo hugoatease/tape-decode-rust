@@ -10,4 +10,5 @@ realfft = "3"
 rustfft = "6"
 sci-rs = "0.4"
 serde = { version = "1", features = ["derive"] }
+tape-dsp = { path = "../tape-dsp" }
 tracing = "0.1"

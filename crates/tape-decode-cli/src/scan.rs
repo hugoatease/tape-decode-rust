@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{bail, Context as _, Result};
 use tape_decode::DecodeProfile;
 
-use crate::reader::{open_source, SampleFormat, SampleSource};
+use tape_rf_io::{open_source, SampleFormat, SampleSource};
 
 /// Contrast above which a window is recorded tape, in dB.
 const SIGNAL_ENTER_DB: f64 = 8.0;

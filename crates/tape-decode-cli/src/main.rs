@@ -1,11 +1,8 @@
 mod cli;
 mod decode;
 mod fields_match;
-mod flac;
 mod metadata;
-mod os;
 mod profiles;
-mod reader;
 mod scan;
 mod trim;
 mod writer;

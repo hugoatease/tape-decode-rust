@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
-use crate::optimized::{
-    exp_fast, narrow_sos, powf_fast_nonneg, scale_field, sosfilt_f32, sosfiltfilt_f32,
-    sum_algebraic, unwrap_angles, ScaleFieldParams,
-};
+use crate::optimized::{scale_field, ScaleFieldParams};
 use crate::request::{ColorSystem, FieldOrderAction, LineSystem, WowInterpolation};
 use crate::spec::DecoderSpec;
 use crate::DeterministicHashMap;
 use anyhow::{bail, Context as _, Result};
 use num_traits::Float;
-use realfft::{ComplexToReal, RealToComplex};
 use rustfft::num_complex::Complex32;
 use rustfft::Fft;
 use sci_rs::signal::filter::design::{FilterBandType, Sos};
 use serde::{Deserialize, Serialize};
+use tape_dsp::{
+    exp_fast, narrow_sos, powf_fast_nonneg, sosfilt_f32, sosfiltfilt_f32, sum_algebraic,
+    unwrap_angles,
+};
 
 // Submodules split out of the original monolithic decode.rs.
 mod chroma;

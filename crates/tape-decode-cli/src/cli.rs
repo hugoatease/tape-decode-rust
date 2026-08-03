@@ -2,7 +2,7 @@
 //! parsed options into a `DecoderSpec` before running the decode.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,14 +12,14 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use crate::decode::{decode_all, decode_all_mt, MtParams};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{PcmAudioParameters, TbcMetadataFull, VideoParameters};
-use crate::os;
 use crate::profiles::{flatten_profile, load_profile, load_profile_file, profile_names};
-use crate::reader::{open_source, DecodeReader, SampleFormat};
 use crate::writer::DecodeWriter;
 use tape_decode::{
     DecodeRequest, DecoderSpec, DropOuts, FieldInfoEntry, FieldOrderAction, NotchFilter,
     WowInterpolation,
 };
+use tape_rf_io as os;
+use tape_rf_io::{open_source, DecodeReader, SampleFormat};
 
 const DEFAULT_THRESHOLD_P_DDD: f32 = 0.18;
 const DEFAULT_HYSTERESIS: f32 = 1.25;
@@ -443,12 +443,7 @@ pub fn run_cli() -> Result<()> {
 }
 
 fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .try_init();
+    tape_rf_io::init_tracing(false);
 }
 
 fn run_scan(cli: ScanArgs) -> Result<()> {
@@ -580,13 +575,7 @@ fn run_trim(cli: TrimArgs) -> Result<()> {
 }
 
 fn run_decode(cli: DecodeArgs) -> Result<()> {
-    let filter = if cli.debug { "debug" } else { "info" };
-    let _ = tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .try_init();
+    tape_rf_io::init_tracing(cli.debug);
 
     let profile = match (cli.profile.as_deref(), cli.profile_file.as_deref()) {
         (Some(name), None) => load_profile(name)?,

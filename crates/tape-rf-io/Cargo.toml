@@ -1,0 +1,18 @@
+[package]
+name = "tape-rf-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+symphonia-bundle-flac = "0.6"
+symphonia-core = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

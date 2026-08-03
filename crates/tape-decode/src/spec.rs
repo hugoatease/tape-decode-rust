@@ -8,11 +8,11 @@ use std::sync::Arc;
 use crate::decode::{
     butter_sos, gen_chroma_heterodyne, ChromaSepClass, BLOCKCUT, BLOCKCUT_END, BLOCKSIZE,
 };
-use crate::optimized::narrow_sos;
 use crate::request::{
     BoostRampFilter, ColorSystem, DecodeRequest, DeemphasisParams, FieldOrderAction, LineSystem,
     NonlinearParams, ShelfKind, VideoLumaFilter, WowInterpolation,
 };
+use tape_dsp::narrow_sos;
 use crate::vec_utils::convert_vec_in_place;
 
 const CHROMA_AUDIO_NOTCH_Q: f64 = 10.0;
