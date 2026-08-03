@@ -223,16 +223,23 @@ pub fn decode(rf: &[f32], params: &PipelineParams) -> Result<(Vec<f32>, Vec<f32>
     let mut post_l = pre_l.clone();
     let mut post_r = pre_r.clone();
 
+    // Prime the expander over exactly one nominal block's worth of
+    // samples, matching Python's block-0-only priming scope — see
+    // VhsPostProcess::process's doc comment for why priming over the
+    // whole stream (this used to pass `true` unconditionally) is a bug,
+    // not just wasted work.
+    let prime_len = Some(layout.block_audio_final_size);
+
     if params.format == TapeFormat::Video8 {
         let mut chain_l = EightMmPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
         let mut chain_r = EightMmPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        chain_l.process(&mut pre_l, &mut post_l, true);
-        chain_r.process(&mut pre_r, &mut post_r, true);
+        chain_l.process(&mut pre_l, &mut post_l, prime_len);
+        chain_r.process(&mut pre_r, &mut post_r, prime_len);
     } else {
         let mut chain_l = VhsPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
         let mut chain_r = VhsPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        chain_l.process(&mut pre_l, &mut post_l, true);
-        chain_r.process(&mut pre_r, &mut post_r, true);
+        chain_l.process(&mut pre_l, &mut post_l, prime_len);
+        chain_r.process(&mut pre_r, &mut post_r, prime_len);
     }
 
     Ok((post_l, post_r))

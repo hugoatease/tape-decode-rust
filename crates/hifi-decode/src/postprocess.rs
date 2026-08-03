@@ -324,18 +324,32 @@ impl VhsPostProcess {
     /// `pre`: dc-blocked demod audio (sidechain source). `post`: the audio
     /// to shape (a copy of `pre`, or the spectral-NR output — spectral NR
     /// is out of scope for this port, so callers should pass a copy of
-    /// `pre`). `is_first_block` primes the expander's envelope state on a
-    /// throwaway copy first, matching Python's block-0 cold-start handling.
-    pub fn process(&mut self, pre: &mut [f32], post: &mut [f32], is_first_block: bool) {
+    /// `pre`). `prime_len`, if given, primes the expander's envelope state
+    /// on a throwaway copy of the first `prime_len` samples before the
+    /// real pass, matching Python's block-0 cold-start handling.
+    ///
+    /// `prime_len` must be the size of *one nominal block* (e.g.
+    /// `BlockLayout::block_audio_final_size`), not the whole signal:
+    /// Python primes using exactly one block's worth of data
+    /// (`expander_vhs_worker` runs per block, and only block 0 primes).
+    /// Priming over the *whole* concatenated stream — an earlier version
+    /// of this port did exactly that — pushes the expander's `env_lin`/
+    /// `hold_state` through an entire extra unwanted pass before the real
+    /// one, which was diagnosed against a real capture: it produced a
+    /// growing amplitude error (correct for the first ~500ms, drifting to
+    /// ~2.6x too quiet after) even though the *shape* still correlated
+    /// above 0.99 with the Python reference.
+    pub fn process(&mut self, pre: &mut [f32], post: &mut [f32], prime_len: Option<usize>) {
         if self.enable_deemphasis {
             self.deemphasis_pre_1.process(pre);
             self.deemphasis_pre_2.process(post);
             self.nr_deemphasis.process(post);
         }
         if self.enable_expander {
-            if is_first_block {
-                let mut pre_copy = pre.to_vec();
-                let mut post_copy = post.to_vec();
+            if let Some(len) = prime_len {
+                let len = len.min(pre.len()).min(post.len());
+                let mut pre_copy = pre[..len].to_vec();
+                let mut post_copy = post[..len].to_vec();
                 self.expander.process(&mut pre_copy, &mut post_copy);
             }
             self.expander.process(pre, post);
@@ -380,16 +394,22 @@ impl EightMmPostProcess {
         }
     }
 
-    pub fn process(&mut self, pre: &mut [f32], post: &mut [f32], is_first_block: bool) {
+    /// See `VhsPostProcess::process`'s doc comment for what `prime_len`
+    /// must be and why priming over more than one block's worth of
+    /// samples is wrong, not just wasteful.
+    pub fn process(&mut self, pre: &mut [f32], post: &mut [f32], prime_len: Option<usize>) {
         if self.enable_deemphasis {
             self.deemphasis_2.process(post);
         }
         if self.enable_expander {
-            if is_first_block {
-                let mut post_copy = post.to_vec();
-                // Deliberately the real `pre`, not a copy: see the struct
-                // doc comment.
-                self.expander.process(pre, &mut post_copy);
+            if let Some(len) = prime_len {
+                let len = len.min(pre.len()).min(post.len());
+                let mut post_copy = post[..len].to_vec();
+                // Deliberately the real `pre`'s prefix, not a copy: see
+                // the struct doc comment. Scoped to `len` (one block) so
+                // only that prefix's envelope state gets corrupted before
+                // the real pass, matching Python's block-0 scope exactly.
+                self.expander.process(&mut pre[..len], &mut post_copy);
             }
             self.expander.process(pre, post);
         }
@@ -454,7 +474,7 @@ mod tests {
             .map(|i| (2.0 * PI * 1000.0 * i as f64 / 48_000.0).sin() as f32 * 0.5)
             .collect();
         let mut post = pre.clone();
-        chain.process(&mut pre, &mut post, true);
+        chain.process(&mut pre, &mut post, Some(n));
         assert!(post.iter().all(|v| v.is_finite() && v.abs() < 100.0));
     }
 }
