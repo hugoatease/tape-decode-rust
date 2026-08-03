@@ -14,20 +14,25 @@
 //!   only within their own block). Runs on a worker-thread pool, one
 //!   block per task, order-independent.
 //! - Each block's *output* is trimmed to its non-overlap span
-//!   (`Block::output_skip`/`output_take`) and blocks are concatenated
-//!   **in order** afterward — cheap, and this is where correctness
+//!   (`Block::output_skip`/`output_take`) and blocks are handed back **in
+//!   order** to the caller as they complete — this is where correctness
 //!   depends on block order, not on parallel execution order.
 //! - `DcBlocker`/`Deemphasis`/`Expander` (`PostProcessParams` chain) carry
-//!   real IIR state across the whole stream, so they run **once**, after
-//!   concatenation, over the full signal — sequential by construction.
-//!   This also sidesteps Python's per-block "prime the state on block 0"
-//!   dance entirely: priming the chain once at the very start of the
-//!   concatenated signal is equivalent to Python's block-by-block priming,
-//!   since both operate on the same contiguous, correctly-ordered stream.
+//!   real IIR state across the whole stream, so they run sequentially, one
+//!   chunk at a time, *as each ordered chunk becomes available* rather than
+//!   after concatenating everything into one buffer first — this is what
+//!   lets the decoded-audio side stream out to disk instead of being held
+//!   in memory for the whole run (mirroring the RF *input* side's
+//!   streaming — see `crate::stream`). Each chain is constructed once
+//!   before the first chunk and mutated across calls, exactly like Python
+//!   carries `PostProcessor`'s state across blocks; only the very first
+//!   chunk primes the expander (matching Python's block-0-only priming —
+//!   see `VhsPostProcess::process`'s doc comment).
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use hifi_decode::{
@@ -131,21 +136,23 @@ type BlockResult = (usize, Block, Vec<f32>, Vec<f32>);
 
 /// Streams RF blocks from `reader` through a worker-thread pool (bounded
 /// by available parallelism), reorders their outputs back into submission
-/// order, trims each to its non-overlap span, and concatenates.
+/// order, trims each to its non-overlap span, and hands each trimmed
+/// chunk to `on_ordered_chunk` **as soon as it's next in line** — never
+/// concatenated into one buffer here.
 ///
 /// This is a small pipeline, not a pre-sliced parallel loop, specifically
-/// so the RF input never has to be fully read into memory: a reader
-/// "thread" (actually just this function's caller, driving
-/// `StreamingBlocks` — see below) produces blocks one at a time and hands
-/// them to workers over a bounded channel; workers decode independently
-/// (nothing here carries state across blocks — see `decode_one_block`'s
-/// doc comment) and send results back over a second channel; this
-/// function's caller thread reorders and trims as results arrive. Only
-/// the reordering buffer (`pending`, bounded by how far worker completion
-/// order can drift from submission order — in practice a handful of
-/// blocks) and the growing decoded-audio output live in memory alongside
-/// whatever's in flight; the RF window itself is bounded to a couple of
-/// blocks by `StreamingBlocks`.
+/// so neither the RF input nor the decoded output ever has to be fully
+/// materialized in memory: a reader "thread" (actually just this
+/// function's caller, driving `StreamingBlocks` — see below) produces
+/// blocks one at a time and hands them to workers over a bounded channel;
+/// workers decode independently (nothing here carries state across blocks
+/// — see `decode_one_block`'s doc comment) and send results back over a
+/// second channel; this function's caller thread reorders, trims, and
+/// forwards chunks as results arrive. Only the reordering buffer
+/// (`pending`, bounded by how far worker completion order can drift from
+/// submission order — in practice a handful of blocks) lives in memory
+/// alongside whatever's in flight; the RF window itself is bounded to a
+/// couple of blocks by `StreamingBlocks`.
 #[allow(clippy::too_many_arguments)]
 fn decode_blocks_streaming(
     reader: &mut DecodeReader,
@@ -157,7 +164,8 @@ fn decode_blocks_streaming(
     doc_params: Option<&DropoutParams>,
     hs_params: Option<&HeadswitchParams>,
     params: &PipelineParams,
-) -> Result<(Vec<f32>, Vec<f32>)> {
+    mut on_ordered_chunk: impl FnMut(Vec<f32>, Vec<f32>, &Block) -> Result<()>,
+) -> Result<()> {
     let worker_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     // A handful of blocks of slack per worker: enough that a worker never
     // starves waiting for input, without letting the reader race arbitrarily
@@ -168,8 +176,7 @@ fn decode_blocks_streaming(
     let (result_tx, result_rx): (SyncSender<BlockResult>, Receiver<BlockResult>) = sync_channel(queue_depth);
     let block_rx = Arc::new(Mutex::new(block_rx));
 
-    let mut audio_l = Vec::new();
-    let mut audio_r = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -205,15 +212,28 @@ fn decode_blocks_streaming(
             }
         });
 
-        // Collector: reorder by index as results arrive, trim, concatenate.
+        // Collector: reorder by index as results arrive, trim, and forward
+        // immediately — nothing is concatenated into a whole-signal buffer
+        // here. On the first forwarding error (e.g. a full disk), stop
+        // calling the callback but keep draining the channels rather than
+        // returning early: workers/the reader thread are still running and
+        // would otherwise block forever trying to send into channels
+        // nobody's receiving from, since `thread::scope` waits for every
+        // spawned thread before this function can return.
         let mut pending: std::collections::HashMap<usize, (Block, Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
         let mut next_expected = 0usize;
         while let Ok((index, block, l, r)) = result_rx.recv() {
             pending.insert(index, (block, l, r));
             while let Some((block, l, r)) = pending.remove(&next_expected) {
-                append_trimmed(&mut audio_l, &l, &block);
-                append_trimmed(&mut audio_r, &r, &block);
                 next_expected += 1;
+                if first_error.is_some() {
+                    continue;
+                }
+                let trimmed_l = trim_block_output(&l, &block);
+                let trimmed_r = trim_block_output(&r, &block);
+                if let Err(e) = on_ordered_chunk(trimmed_l, trimmed_r, &block) {
+                    first_error = Some(e);
+                }
             }
         }
         // `pending` non-empty here would mean a block result never arrived
@@ -231,23 +251,145 @@ fn decode_blocks_streaming(
         });
     });
 
-    Ok((audio_l, audio_r))
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
-fn append_trimmed(dest: &mut Vec<f32>, block_output: &[f32], block: &Block) {
+fn trim_block_output(block_output: &[f32], block: &Block) -> Vec<f32> {
     let len = block_output.len();
     let skip = block.output_skip.min(len);
     let take = block.output_take.min(len - skip);
-    dest.extend_from_slice(&block_output[skip..skip + take]);
+    block_output[skip..skip + take].to_vec()
 }
 
-/// Decodes the whole of `reader`'s RF input to a stereo (or mono, for the
-/// `l`/`r`/`sum` decode modes) pair of final-rate audio buffers. Streams
-/// the input (see `decode_blocks_streaming`/`crate::stream`) rather than
-/// reading it into memory upfront — the only thing this function itself
-/// holds in full is the *decoded* audio, which for even an hour-long tape
-/// is a few hundred MB, unlike the multi-tens-of-GB raw RF stream.
-pub fn decode(reader: &mut DecodeReader, params: &PipelineParams) -> Result<(Vec<f32>, Vec<f32>)> {
+/// How often progress gets logged, wall-clock time — independent of
+/// decode speed (which varies a lot with thread count/hardware) so a fast
+/// run doesn't spam the log and a slow one doesn't go silent for minutes.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Tracks and periodically logs how far a `decode` call has gotten,
+/// mirroring `tape-decode-cli`'s own field-count/FPS progress logging
+/// (`tape-decode-cli/src/writer.rs`) — the same idea, adapted to
+/// hifi-decode having a cheaply knowable *input* size (a real, seekable
+/// RF capture) to report a percentage/ETA against, which the video
+/// decoder's field-at-a-time model doesn't have.
+struct Progress {
+    start: Instant,
+    last_log: Instant,
+    total_input_samples: Option<u64>,
+    audio_final_rate: f64,
+    decoded_samples: u64,
+    logged_once: bool,
+}
+
+impl Progress {
+    fn new(total_input_samples: Option<u64>, audio_final_rate: f64) -> Self {
+        let now = Instant::now();
+        Progress {
+            start: now,
+            last_log: now,
+            total_input_samples,
+            audio_final_rate,
+            decoded_samples: 0,
+            logged_once: false,
+        }
+    }
+
+    /// Call once per ordered chunk, after it's been fully processed.
+    /// `read_end` is the RF-input position of the *nominal* (non-overlap)
+    /// end of the block this chunk came from — the same field `Block`
+    /// carries — used as "how far into the input have we gotten" for the
+    /// percentage/ETA, distinct from `decoded_samples` (how much *output*
+    /// audio exists so far, used for the realtime-multiplier figure).
+    fn record(&mut self, chunk_len: usize, read_end: usize) {
+        self.decoded_samples += chunk_len as u64;
+        let now = Instant::now();
+        if self.logged_once && now.duration_since(self.last_log) < PROGRESS_LOG_INTERVAL {
+            return;
+        }
+        self.last_log = now;
+        self.logged_once = true;
+        self.log(now, read_end);
+    }
+
+    fn log(&self, now: Instant, read_end: usize) {
+        let elapsed = now.duration_since(self.start).as_secs_f64();
+        let decoded_secs = self.decoded_samples as f64 / self.audio_final_rate;
+        let realtime_x = if elapsed > 0.0 { decoded_secs / elapsed } else { 0.0 };
+        match self.total_input_samples {
+            Some(total) if total > 0 => {
+                let pct = (read_end as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
+                let eta_secs = if pct > 0.1 { elapsed * (100.0 - pct) / pct } else { f64::NAN };
+                tracing::info!(
+                    "decoded {decoded_secs:.1}s of audio so far ({pct:.1}% of input, ETA {eta}) \
+                     in {elapsed:.1}s ({realtime_x:.2}x realtime)",
+                    eta = format_duration(eta_secs),
+                );
+            }
+            _ => {
+                tracing::info!("decoded {decoded_secs:.1}s of audio so far in {elapsed:.1}s ({realtime_x:.2}x realtime)");
+            }
+        }
+    }
+
+    /// Called once after the last chunk, regardless of the throttle
+    /// interval, so a run that finishes faster than `PROGRESS_LOG_INTERVAL`
+    /// still gets a final status line instead of total silence.
+    fn finish(&self) {
+        self.log(Instant::now(), self.total_input_samples.unwrap_or(0) as usize);
+    }
+}
+
+fn format_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "unknown".to_string();
+    }
+    let secs = secs.round() as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// The two post-processing chain shapes (`VhsPostProcess`/
+/// `EightMmPostProcess` differ in stage ordering — see their doc
+/// comments), unified so `decode` can hold one chain per channel across
+/// the whole streamed run without duplicating the per-chunk call site per
+/// format.
+enum PostChain {
+    Vhs(VhsPostProcess),
+    EightMm(EightMmPostProcess),
+}
+
+impl PostChain {
+    fn new(format: TapeFormat, audio_rate: f64, params: PostProcessParams, enable_deemphasis: bool, enable_expander: bool) -> Self {
+        if format == TapeFormat::Video8 {
+            PostChain::EightMm(EightMmPostProcess::new(audio_rate, params, enable_deemphasis, enable_expander))
+        } else {
+            PostChain::Vhs(VhsPostProcess::new(audio_rate, params, enable_deemphasis, enable_expander))
+        }
+    }
+
+    fn process(&mut self, pre: &mut [f32], post: &mut [f32], prime_len: Option<usize>) {
+        match self {
+            PostChain::Vhs(chain) => chain.process(pre, post, prime_len),
+            PostChain::EightMm(chain) => chain.process(pre, post, prime_len),
+        }
+    }
+}
+
+/// Decodes the whole of `reader`'s RF input, calling `on_chunk` with each
+/// consecutive span of final-rate stereo (or mono, for the `l`/`r`/`sum`
+/// decode modes) audio as soon as it's ready — in order, never all at
+/// once. Streams both the input (see `decode_blocks_streaming`/
+/// `crate::stream`) and the output this way: neither the raw RF nor the
+/// decoded audio is ever fully materialized in memory here, so callers
+/// (e.g. `cli::run_cli`, forwarding chunks straight into a file writer)
+/// can decode arbitrarily long captures in bounded memory.
+pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: impl FnMut(&[f32], &[f32]) -> Result<()>) -> Result<()> {
     if params.demod_type != DemodType::Quadrature {
         bail!("only quadrature demodulation is implemented in this port; the Hilbert path is not yet ported");
     }
@@ -275,45 +417,58 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams) -> Result<(Vec
         .head_switching_interpolation
         .then(|| HeadswitchParams::new(AUDIO_RATE_INTERMEDIATE, hifi_decode::field_rate(params.system)));
 
-    let (audio_l, audio_r) = decode_blocks_streaming(reader, &layout, &afe_l, &afe_r, &disc_l, &disc_r, doc_params.as_ref(), hs_params.as_ref(), params)?;
-
-    let (mut pre_l, mut pre_r) = (audio_l, audio_r);
-
-    if params.gain != 1.0 {
-        for sample in pre_l.iter_mut().chain(pre_r.iter_mut()) {
-            *sample *= params.gain as f32;
-        }
-    }
-
-    // DC blocking and de-emphasis/expansion carry continuous IIR state, so
-    // they run once, sequentially, over the whole concatenated signal —
-    // see the module doc comment.
+    // DC blocking and de-emphasis/expansion carry continuous IIR state
+    // across the whole stream — see the module doc comment — so each is
+    // constructed once, here, and mutated across every chunk the collector
+    // below hands it, in order.
     let mut dc_blocker_l = DcBlocker::new(params.audio_final_rate, 1.0);
     let mut dc_blocker_r = DcBlocker::new(params.audio_final_rate, 1.0);
-    dc_blocker_l.process(&mut pre_l);
-    dc_blocker_r.process(&mut pre_r);
+    let mut chain_l = PostChain::new(params.format, params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
+    let mut chain_r = PostChain::new(params.format, params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
+    let mut is_first_chunk = true;
+    let mut progress = Progress::new(reader.total_samples(), params.audio_final_rate);
 
-    let mut post_l = pre_l.clone();
-    let mut post_r = pre_r.clone();
+    decode_blocks_streaming(
+        reader,
+        &layout,
+        &afe_l,
+        &afe_r,
+        &disc_l,
+        &disc_r,
+        doc_params.as_ref(),
+        hs_params.as_ref(),
+        params,
+        |mut pre_l, mut pre_r, block| {
+            if params.gain != 1.0 {
+                for sample in pre_l.iter_mut().chain(pre_r.iter_mut()) {
+                    *sample *= params.gain as f32;
+                }
+            }
 
-    // Prime the expander over exactly one nominal block's worth of
-    // samples, matching Python's block-0-only priming scope — see
-    // VhsPostProcess::process's doc comment for why priming over the
-    // whole stream (this used to pass `true` unconditionally) is a bug,
-    // not just wasted work.
-    let prime_len = Some(layout.block_audio_final_size);
+            dc_blocker_l.process(&mut pre_l);
+            dc_blocker_r.process(&mut pre_r);
 
-    if params.format == TapeFormat::Video8 {
-        let mut chain_l = EightMmPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        let mut chain_r = EightMmPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        chain_l.process(&mut pre_l, &mut post_l, prime_len);
-        chain_r.process(&mut pre_r, &mut post_r, prime_len);
-    } else {
-        let mut chain_l = VhsPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        let mut chain_r = VhsPostProcess::new(params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
-        chain_l.process(&mut pre_l, &mut post_l, prime_len);
-        chain_r.process(&mut pre_r, &mut post_r, prime_len);
-    }
+            let mut post_l = pre_l.clone();
+            let mut post_r = pre_r.clone();
 
-    Ok((post_l, post_r))
+            // Only the very first chunk primes the expander, over exactly
+            // that chunk's own length — matching Python's block-0-only
+            // priming scope over one block's worth of data. Priming on
+            // every chunk (or over more than one chunk's worth) is wrong,
+            // not just wasteful — see `VhsPostProcess::process`'s doc
+            // comment for the real-capture bug this caused when an
+            // earlier version of this port primed over the whole stream.
+            let prime_len = is_first_chunk.then_some(pre_l.len());
+            is_first_chunk = false;
+
+            chain_l.process(&mut pre_l, &mut post_l, prime_len);
+            chain_r.process(&mut pre_r, &mut post_r, prime_len);
+
+            progress.record(post_l.len(), block.read_end);
+            on_chunk(&post_l, &post_r)
+        },
+    )?;
+
+    progress.finish();
+    Ok(())
 }

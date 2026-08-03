@@ -175,6 +175,18 @@ impl<F: SampleEncoding> Source<F> {
 }
 
 impl<F: SampleEncoding> SampleSource for Source<F> {
+    fn total_samples(&self) -> Option<u64> {
+        // `byte_len()` isn't gated on seekability by symphonia — for a
+        // pipe (stdin) it can return a small, meaningless value (e.g. a
+        // platform's pipe buffer accounting via `fstat`, not a real
+        // total), so only trust it for an actually-seekable source (a
+        // regular file).
+        if !self.stream.is_seekable() {
+            return None;
+        }
+        self.stream.byte_len().map(|bytes| bytes / F::BYTES as u64)
+    }
+
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let want = out.len() * F::BYTES;
         self.scratch.resize(want, 0);
@@ -224,6 +236,14 @@ pub trait SampleSource: Send {
     fn read(&mut self, out: &mut [f32]) -> Result<usize>;
     /// Seek to absolute sample `sample`.
     fn seek_samples(&mut self, sample: u64) -> Result<()>;
+    /// Total sample count, if cheaply knowable upfront (a seekable, regular
+    /// file whose format reports a length or total-sample count) — used
+    /// only to show decode progress as a percentage/ETA. `None` (the
+    /// default) means progress can still be reported, just without a
+    /// percentage: unseekable pipes (stdin) have no length to report.
+    fn total_samples(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Open `input` as a sample source in the given `format`. The path `-` selects
@@ -288,6 +308,11 @@ impl DecodeReader {
             self.eof = true;
         }
         Ok(())
+    }
+
+    /// See [`SampleSource::total_samples`].
+    pub fn total_samples(&self) -> Option<u64> {
+        self.source.total_samples()
     }
 }
 

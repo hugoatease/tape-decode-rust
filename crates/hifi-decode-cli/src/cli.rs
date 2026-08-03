@@ -22,7 +22,7 @@ use hifi_decode::{AfeOverrides, DecodeMode, EnvDetection, PostProcessParams, Res
 use tape_rf_io::SampleFormat;
 
 use crate::pipeline::{DemodType, DocMode, PipelineParams};
-use crate::writer::{write_flac, write_wav};
+use crate::writer::AudioSink;
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum OnOff {
@@ -412,44 +412,63 @@ pub fn run_cli() -> Result<()> {
     };
     let mut reader = tape_rf_io::DecodeReader::new(tape_rf_io::open_source(input_file, input_format)?);
 
-    // Streams the input rather than reading it into memory upfront (see
-    // pipeline::decode's doc comment) — a multi-gigabyte RF capture would
-    // otherwise need several times its file size in RAM as f32.
-    let (left, right) = crate::pipeline::decode(&mut reader, &params)?;
-    if left.is_empty() && right.is_empty() {
-        bail!("no input samples read from {}", cli.infile.display());
-    }
+    // Streams both the input and the output rather than holding either in
+    // memory upfront (see pipeline::decode's doc comment) — a
+    // multi-gigabyte RF capture would otherwise need several times its
+    // file size in RAM as f32, and the decoded audio would add more on
+    // top. Output files are created lazily, on the first chunk actually
+    // decoded, so a zero-sample input leaves no output file behind (same
+    // observable behavior as the old "read fully, check empty, then
+    // write" order, just without needing the whole buffer to check it).
+    let sample_rate = params.audio_final_rate as u32;
+    let is_wav = cli.outfile.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    let is_dual_mono = mode == DecodeMode::DualMono || mode == DecodeMode::DualMonoMs;
+    let (path1, path2) = dual_mono_paths(&cli.outfile);
 
-    write_output(&cli.outfile, params.audio_final_rate as u32, mode, &left, &right, cli.overwrite)?;
-    tracing::info!("wrote {}", cli.outfile.display());
-    Ok(())
-}
-
-fn write_output(outfile: &PathBuf, sample_rate: u32, mode: DecodeMode, left: &[f32], right: &[f32], overwrite: bool) -> Result<()> {
-    let is_wav = outfile.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-
-    if !overwrite {
-        check_does_not_exist(outfile)?;
-    }
-
-    if mode == DecodeMode::DualMono || mode == DecodeMode::DualMonoMs {
-        let (path1, path2) = dual_mono_paths(outfile);
-        if !overwrite {
+    if !cli.overwrite {
+        if is_dual_mono {
             check_does_not_exist(&path1)?;
             check_does_not_exist(&path2)?;
-        }
-        if is_wav {
-            write_wav(&path1, sample_rate, left, None)?;
-            write_wav(&path2, sample_rate, right, None)?;
         } else {
-            write_flac(&path1, sample_rate, left, None)?;
-            write_flac(&path2, sample_rate, right, None)?;
+            check_does_not_exist(&cli.outfile)?;
         }
-    } else if is_wav {
-        write_wav(outfile, sample_rate, left, Some(right))?;
-    } else {
-        write_flac(outfile, sample_rate, left, Some(right))?;
     }
+
+    let mut sink: Option<AudioSink> = None;
+    let mut sink2: Option<AudioSink> = None;
+    let mut total_samples = 0usize;
+
+    crate::pipeline::decode(&mut reader, &params, |left, right| {
+        total_samples += left.len();
+        if is_dual_mono {
+            if sink.is_none() {
+                sink = Some(AudioSink::create(&path1, sample_rate, 1, is_wav)?);
+            }
+            sink.as_mut().unwrap().write_chunk(left, None)?;
+            if sink2.is_none() {
+                sink2 = Some(AudioSink::create(&path2, sample_rate, 1, is_wav)?);
+            }
+            sink2.as_mut().unwrap().write_chunk(right, None)?;
+        } else {
+            if sink.is_none() {
+                sink = Some(AudioSink::create(&cli.outfile, sample_rate, 2, is_wav)?);
+            }
+            sink.as_mut().unwrap().write_chunk(left, Some(right))?;
+        }
+        Ok(())
+    })?;
+
+    if total_samples == 0 {
+        bail!("no input samples read from {}", cli.infile.display());
+    }
+    if let Some(sink) = sink {
+        sink.finish()?;
+    }
+    if let Some(sink2) = sink2 {
+        sink2.finish()?;
+    }
+
+    tracing::info!("wrote {}", cli.outfile.display());
     Ok(())
 }
 

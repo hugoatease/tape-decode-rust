@@ -144,6 +144,10 @@ impl FlacSource {
 }
 
 impl SampleSource for FlacSource {
+    fn total_samples(&self) -> Option<u64> {
+        self.reader.tracks().first()?.num_frames
+    }
+
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let mut written = 0;
         while written < out.len() {
