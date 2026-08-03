@@ -66,7 +66,7 @@ jobs:
             esac
             echo "::group::Build Windows ${level}"
             CARGO_TARGET_DIR="target-x86-64-${level}" RUSTFLAGS="$rustflags" \
-              cargo build --release --target x86_64-pc-windows-msvc --bin tape-decode
+              cargo build --release --target x86_64-pc-windows-msvc --bin tape-decode --bin hifi-decode
             echo "::endgroup::"
           }
           for level in v1 v2 v3 v4; do
@@ -101,6 +101,23 @@ jobs:
           echo "Smoking: $BIN"
           TAPE_DECODE_MICROARCH=x86-64-v1 "$BIN" list-profiles | tee /tmp/tape_decode_profiles.txt
           grep -q "PAL_VHS" /tmp/tape_decode_profiles.txt
+
+      - name: Smoke test raw hifi-decode binary (Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=""
+          for lvl in v1 v2 v3 v4; do
+            p="target-x86-64-${lvl}/x86_64-pc-windows-msvc/release/hifi-decode.exe"
+            if [ -f "$p" ]; then BIN="$p"; break; fi
+          done
+          if [ -z "$BIN" ]; then BIN="target/x86_64-pc-windows-msvc/release/hifi-decode.exe"; fi
+          if [ ! -f "$BIN" ]; then
+            echo "No hifi-decode.exe found for smoke test"; ls -la target*/x86_64-pc-windows-msvc/release/ || true; exit 1
+          fi
+          echo "Smoking: $BIN"
+          "$BIN" --help | tee /tmp/hifi_decode_help.txt
+          grep -q "HiFi FM RF captures" /tmp/hifi_decode_help.txt
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -186,7 +203,7 @@ jobs:
 
       - name: Build tape-decode core (single, for bundling)
         if: matrix.arch != 'x86_64'
-        run: cargo build --release --target "${{ matrix.target }}" --bin tape-decode
+        run: cargo build --release --target "${{ matrix.target }}" --bin tape-decode --bin hifi-decode
 
       - name: Build tape-decode core (x86-64 v1-v4 levels, for bundling)
         if: matrix.arch == 'x86_64'
@@ -203,7 +220,7 @@ jobs:
             esac
             echo "::group::Build ${level}"
             CARGO_TARGET_DIR="target-x86-64-${level}" RUSTFLAGS="$rustflags" \
-              cargo build --release --target "${{ matrix.target }}" --bin tape-decode
+              cargo build --release --target "${{ matrix.target }}" --bin tape-decode --bin hifi-decode
             echo "::endgroup::"
           }
           for level in v1 v2 v3 v4; do
@@ -238,6 +255,33 @@ jobs:
             echo "Smoking: $BIN"
             "$BIN" list-profiles | tee /tmp/tape_decode_profiles.txt
             grep -q "PAL_VHS" /tmp/tape_decode_profiles.txt
+          fi
+
+      - name: Smoke test raw hifi-decode binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            BIN=""
+            for lvl in v1 v2 v3 v4; do
+              p="target-x86-64-${lvl}/x86_64-unknown-linux-gnu/release/hifi-decode"
+              if [ -f "$p" ]; then BIN="$p"; break; fi
+            done
+            if [ -z "$BIN" ]; then BIN="target/x86_64-unknown-linux-gnu/release/hifi-decode"; fi
+            if [ ! -f "$BIN" ]; then
+              echo "No hifi-decode binary found for smoke"; ls -la target*/x86_64-unknown-linux-gnu/release/ || true; exit 1
+            fi
+            echo "Smoking: $BIN"
+            "$BIN" --help | tee /tmp/hifi_decode_help.txt
+            grep -q "HiFi FM RF captures" /tmp/hifi_decode_help.txt
+          else
+            BIN="target/aarch64-unknown-linux-gnu/release/hifi-decode"
+            if [ ! -f "$BIN" ]; then
+              echo "No hifi-decode binary found for smoke"; ls -la target/aarch64-unknown-linux-gnu/release/ || true; exit 1
+            fi
+            echo "Smoking: $BIN"
+            "$BIN" --help | tee /tmp/hifi_decode_help.txt
+            grep -q "HiFi FM RF captures" /tmp/hifi_decode_help.txt
           fi
 
       - name: Setup Python (for decode launcher)
@@ -374,7 +418,7 @@ jobs:
 
       - name: Build tape-decode core (single, for bundling)
         if: matrix.arch != 'x86_64'
-        run: cargo build --release --target "${{ matrix.target }}" --bin tape-decode
+        run: cargo build --release --target "${{ matrix.target }}" --bin tape-decode --bin hifi-decode
 
       - name: Build tape-decode core (x86-64 v1-v4 levels, for bundling)
         if: matrix.arch == 'x86_64'
@@ -391,7 +435,7 @@ jobs:
             esac
             echo "::group::Build ${level}"
             CARGO_TARGET_DIR="target-x86-64-${level}" RUSTFLAGS="$rustflags" \
-              cargo build --release --target "${{ matrix.target }}" --bin tape-decode
+              cargo build --release --target "${{ matrix.target }}" --bin tape-decode --bin hifi-decode
             echo "::endgroup::"
           }
           for level in v1 v2 v3 v4; do
@@ -426,6 +470,33 @@ jobs:
             echo "Smoking: $BIN"
             "$BIN" list-profiles | tee /tmp/tape_decode_profiles.txt
             grep -q "PAL_VHS" /tmp/tape_decode_profiles.txt
+          fi
+
+      - name: Smoke test raw hifi-decode binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            BIN=""
+            for lvl in v1 v2 v3 v4; do
+              p="target-x86-64-${lvl}/x86_64-apple-darwin/release/hifi-decode"
+              if [ -f "$p" ]; then BIN="$p"; break; fi
+            done
+            if [ -z "$BIN" ]; then BIN="target/x86_64-apple-darwin/release/hifi-decode"; fi
+            if [ ! -f "$BIN" ]; then
+              echo "No hifi-decode binary found for smoke"; ls -la target*/x86_64-apple-darwin/release/ || true; exit 1
+            fi
+            echo "Smoking: $BIN"
+            "$BIN" --help | tee /tmp/hifi_decode_help.txt
+            grep -q "HiFi FM RF captures" /tmp/hifi_decode_help.txt
+          else
+            BIN="target/aarch64-apple-darwin/release/hifi-decode"
+            if [ ! -f "$BIN" ]; then
+              echo "No hifi-decode binary found for smoke"; ls -la target/aarch64-apple-darwin/release/ || true; exit 1
+            fi
+            echo "Smoking: $BIN"
+            "$BIN" --help | tee /tmp/hifi_decode_help.txt
+            grep -q "HiFi FM RF captures" /tmp/hifi_decode_help.txt
           fi
 
       - name: Setup Python (for decode launcher)
