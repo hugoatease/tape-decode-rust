@@ -9,12 +9,22 @@ use tracing::error;
 /// Input encoding. The raw formats widen straight to `f32` with no rescaling
 /// (so `S16LE` is little-endian `i16`, `F32LE` is passed through verbatim);
 /// `Flac` is decoded by [`crate::flac`].
+///
+/// `U10LE`/`S10LE`/`U12LE`/`S12LE` are **not** bit-packed formats: like
+/// `U16LE`/`S16LE`, they are full 16-bit words on disk (some ADC drivers
+/// only fill 10 or 12 bits of dynamic range into a 16-bit container). Only
+/// the normalization scale differs — matches hifi-decode's
+/// `format_scaling.py`.
 #[derive(Clone, Copy, Debug)]
 pub enum SampleFormat {
     U8,
     S8,
     S16LE,
     U16LE,
+    U10LE,
+    S10LE,
+    U12LE,
+    S12LE,
     F32LE,
     Flac,
 }
@@ -75,6 +85,58 @@ impl SampleEncoding for U16Sample {
         const INV: f32 = 1.0 / 32767.5;
         for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
             *dst = (f32::from(u16::from_le_bytes([word[0], word[1]])) - MID) * INV;
+        }
+    }
+}
+
+/// One little-endian `u16` per sample, normalized as if only the low 10
+/// bits carry signal (`format_scaling.py:_u10_to_f32`).
+struct U10Sample;
+impl SampleEncoding for U10Sample {
+    const BYTES: usize = 2;
+    fn widen(bytes: &[u8], out: &mut [f32]) {
+        const SCALE: f32 = 2.0 / 1023.0;
+        for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            *dst = f32::from(u16::from_le_bytes([word[0], word[1]])) * SCALE - 1.0;
+        }
+    }
+}
+
+/// One little-endian `i16` per sample, normalized as if only the low 10
+/// bits carry signal (`format_scaling.py:_s10_to_f32`).
+struct S10Sample;
+impl SampleEncoding for S10Sample {
+    const BYTES: usize = 2;
+    fn widen(bytes: &[u8], out: &mut [f32]) {
+        const INV: f32 = 1.0 / 512.0;
+        for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            *dst = f32::from(i16::from_le_bytes([word[0], word[1]])) * INV;
+        }
+    }
+}
+
+/// One little-endian `u16` per sample, normalized as if only the low 12
+/// bits carry signal (`format_scaling.py:_u12_to_f32`).
+struct U12Sample;
+impl SampleEncoding for U12Sample {
+    const BYTES: usize = 2;
+    fn widen(bytes: &[u8], out: &mut [f32]) {
+        const SCALE: f32 = 2.0 / 4095.0;
+        for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            *dst = f32::from(u16::from_le_bytes([word[0], word[1]])) * SCALE - 1.0;
+        }
+    }
+}
+
+/// One little-endian `i16` per sample, normalized as if only the low 12
+/// bits carry signal (`format_scaling.py:_s12_to_f32`).
+struct S12Sample;
+impl SampleEncoding for S12Sample {
+    const BYTES: usize = 2;
+    fn widen(bytes: &[u8], out: &mut [f32]) {
+        const INV: f32 = 1.0 / 2048.0;
+        for (dst, word) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            *dst = f32::from(i16::from_le_bytes([word[0], word[1]])) * INV;
         }
     }
 }
@@ -175,6 +237,10 @@ pub fn open_source(file: File, format: SampleFormat) -> Result<Box<dyn SampleSou
         SampleFormat::S8 => raw::<S8Sample>(source),
         SampleFormat::S16LE => raw::<S16Sample>(source),
         SampleFormat::U16LE => raw::<U16Sample>(source),
+        SampleFormat::U10LE => raw::<U10Sample>(source),
+        SampleFormat::S10LE => raw::<S10Sample>(source),
+        SampleFormat::U12LE => raw::<U12Sample>(source),
+        SampleFormat::S12LE => raw::<S12Sample>(source),
         SampleFormat::F32LE => raw::<F32Sample>(source),
         SampleFormat::Flac => crate::flac::open(source),
     }
@@ -222,5 +288,31 @@ impl DecodeReader {
             self.eof = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checked directly against `vhsdecode/hifi/format_scaling.py`'s
+    /// `_u10_to_f32`/`_s10_to_f32`/`_u12_to_f32`/`_s12_to_f32`.
+    #[test]
+    fn ten_and_twelve_bit_scales_match_python_format_scaling() {
+        let mut out = [0.0f32; 1];
+
+        U10Sample::widen(&1023u16.to_le_bytes(), &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        U10Sample::widen(&0u16.to_le_bytes(), &mut out);
+        assert!((out[0] - (-1.0)).abs() < 1e-6);
+
+        S10Sample::widen(&512i16.to_le_bytes(), &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+
+        U12Sample::widen(&4095u16.to_le_bytes(), &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-6);
+
+        S12Sample::widen(&2048i16.to_le_bytes(), &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-6);
     }
 }

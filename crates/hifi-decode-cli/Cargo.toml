@@ -1,0 +1,17 @@
+[package]
+name = "hifi-decode-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hifi-decode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+flacenc = "0.4"
+hifi-decode = { path = "../hifi-decode" }
+hound = "3"
+tape-rf-io = { path = "../tape-rf-io" }
+tracing = "0.1"

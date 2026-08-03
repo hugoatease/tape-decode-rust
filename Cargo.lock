@@ -183,6 +183,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccaeedb56da03b09f598226e25e80088cb4cd25f316e6e4df7d695f0feeb1403"
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -216,11 +231,14 @@ checksum = "fb6da14d3c6605689b5c9ed5187a5218a6d3888e14b747bc18fd4e4bafd452bd"
 dependencies = [
  "built",
  "crc",
+ "crossbeam-channel",
  "heapless",
+ "log",
  "md-5",
  "num-traits",
  "rustversion",
  "seq-macro",
+ "serde",
 ]
 
 [[package]]
@@ -258,6 +276,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
+ "serde",
  "stable_deref_trait",
 ]
 
@@ -280,6 +299,25 @@ dependencies = [
  "tape-dsp",
  "tracing",
 ]
+
+[[package]]
+name = "hifi-decode-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flacenc",
+ "hifi-decode",
+ "hound",
+ "tape-rf-io",
+ "tracing",
+]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "is_terminal_polyfill"

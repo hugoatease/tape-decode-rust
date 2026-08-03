@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/hifi-decode",
+    "crates/hifi-decode-cli",
     "crates/tape-decode",
     "crates/tape-decode-cli",
     "crates/tape-dsp",
