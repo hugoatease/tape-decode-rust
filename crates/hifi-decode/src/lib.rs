@@ -3,6 +3,7 @@
 //! `PostProcessor` (Python, in the `vhs-decode` repository).
 
 mod afe;
+mod block;
 mod demod;
 mod dropout;
 mod find_peaks;
@@ -12,6 +13,7 @@ mod resample;
 mod stereo;
 
 pub use afe::{field_rate, AfeFilter, AfeOverrides, AfeParams, System, TapeFormat};
+pub use block::{Block, BlockLayout};
 pub use demod::FmDiscriminator;
 pub use dropout::{cancel_dc_trim, dropout_compensate, DropoutParams};
 pub use find_peaks::{find_peaks, FindPeaksOptions, Peak};
