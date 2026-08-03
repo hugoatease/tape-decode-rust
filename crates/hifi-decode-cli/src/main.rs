@@ -1,5 +1,6 @@
 mod cli;
 mod pipeline;
+mod stream;
 mod writer;
 
 fn main() {

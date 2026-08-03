@@ -412,21 +412,13 @@ pub fn run_cli() -> Result<()> {
     };
     let mut reader = tape_rf_io::DecodeReader::new(tape_rf_io::open_source(input_file, input_format)?);
 
-    let mut rf = Vec::new();
-    let mut chunk = vec![0.0f32; 1 << 20];
-    loop {
-        let n = reader.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        rf.extend_from_slice(&chunk[..n]);
-    }
-    if rf.is_empty() {
+    // Streams the input rather than reading it into memory upfront (see
+    // pipeline::decode's doc comment) — a multi-gigabyte RF capture would
+    // otherwise need several times its file size in RAM as f32.
+    let (left, right) = crate::pipeline::decode(&mut reader, &params)?;
+    if left.is_empty() && right.is_empty() {
         bail!("no input samples read from {}", cli.infile.display());
     }
-    tracing::info!("read {} RF samples", rf.len());
-
-    let (left, right) = crate::pipeline::decode(&rf, &params)?;
 
     write_output(&cli.outfile, params.audio_final_rate as u32, mode, &left, &right, cli.overwrite)?;
     tracing::info!("wrote {}", cli.outfile.display());

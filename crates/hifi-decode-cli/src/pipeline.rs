@@ -25,6 +25,8 @@
 //!   concatenated signal is equivalent to Python's block-by-block priming,
 //!   since both operate on the same contiguous, correctly-ordered stream.
 
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{bail, Result};
@@ -34,6 +36,9 @@ use hifi_decode::{
     DropoutParams, EightMmPostProcess, FmDiscriminator, HeadswitchParams, PostProcessParams,
     ResamplerQuality, System, TapeFormat, VhsPostProcess,
 };
+use tape_rf_io::DecodeReader;
+
+use crate::stream::StreamingBlocks;
 
 const AUDIO_RATE_INTERMEDIATE: f64 = 192_000.0;
 const PRE_TRIM: usize = 1000;
@@ -122,12 +127,28 @@ fn decode_one_block(
     mix_for_mode_stereo(&audio_l, &audio_r, params.mode)
 }
 
-/// Runs `decode_one_block` for every block in `layout.blocks(rf.len())`
-/// across a worker-thread pool (bounded by available parallelism), then
-/// trims each block's output to its non-overlap span and concatenates in
-/// order.
-fn decode_blocks_parallel(
-    rf: &[f32],
+type BlockResult = (usize, Block, Vec<f32>, Vec<f32>);
+
+/// Streams RF blocks from `reader` through a worker-thread pool (bounded
+/// by available parallelism), reorders their outputs back into submission
+/// order, trims each to its non-overlap span, and concatenates.
+///
+/// This is a small pipeline, not a pre-sliced parallel loop, specifically
+/// so the RF input never has to be fully read into memory: a reader
+/// "thread" (actually just this function's caller, driving
+/// `StreamingBlocks` — see below) produces blocks one at a time and hands
+/// them to workers over a bounded channel; workers decode independently
+/// (nothing here carries state across blocks — see `decode_one_block`'s
+/// doc comment) and send results back over a second channel; this
+/// function's caller thread reorders and trims as results arrive. Only
+/// the reordering buffer (`pending`, bounded by how far worker completion
+/// order can drift from submission order — in practice a handful of
+/// blocks) and the growing decoded-audio output live in memory alongside
+/// whatever's in flight; the RF window itself is bounded to a couple of
+/// blocks by `StreamingBlocks`.
+#[allow(clippy::too_many_arguments)]
+fn decode_blocks_streaming(
+    reader: &mut DecodeReader,
     layout: &BlockLayout,
     afe_l: &AfeFilter,
     afe_r: &AfeFilter,
@@ -136,32 +157,81 @@ fn decode_blocks_parallel(
     doc_params: Option<&DropoutParams>,
     hs_params: Option<&HeadswitchParams>,
     params: &PipelineParams,
-) -> (Vec<f32>, Vec<f32>) {
-    let blocks = layout.blocks(rf.len());
-    let mut results: Vec<Option<(Vec<f32>, Vec<f32>)>> = (0..blocks.len()).map(|_| None).collect();
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let worker_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // A handful of blocks of slack per worker: enough that a worker never
+    // starves waiting for input, without letting the reader race arbitrarily
+    // far ahead of decoding (which would defeat the point of streaming).
+    let queue_depth = (worker_count * 2).max(2);
 
-    let worker_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(blocks.len().max(1));
-    let chunk_size = blocks.len().div_ceil(worker_count.max(1)).max(1);
-
-    thread::scope(|scope| {
-        for (block_chunk, result_chunk) in blocks.chunks(chunk_size).zip(results.chunks_mut(chunk_size)) {
-            scope.spawn(move || {
-                for (block, slot) in block_chunk.iter().zip(result_chunk.iter_mut()) {
-                    let rf_block = &rf[block.read_start..block.read_end];
-                    *slot = Some(decode_one_block(rf_block, afe_l, afe_r, disc_l, disc_r, doc_params, hs_params, params));
-                }
-            });
-        }
-    });
+    let (block_tx, block_rx): (SyncSender<(usize, Block, Vec<f32>)>, Receiver<_>) = sync_channel(queue_depth);
+    let (result_tx, result_rx): (SyncSender<BlockResult>, Receiver<BlockResult>) = sync_channel(queue_depth);
+    let block_rx = Arc::new(Mutex::new(block_rx));
 
     let mut audio_l = Vec::new();
     let mut audio_r = Vec::new();
-    for (block, result) in blocks.iter().zip(results) {
-        let (block_l, block_r) = result.expect("every block slot was filled by a worker");
-        append_trimmed(&mut audio_l, &block_l, block);
-        append_trimmed(&mut audio_r, &block_r, block);
-    }
-    (audio_l, audio_r)
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let block_rx = Arc::clone(&block_rx);
+            let result_tx = result_tx.clone();
+            scope.spawn(move || loop {
+                let received = { block_rx.lock().expect("block queue mutex poisoned").recv() };
+                let Ok((index, block, rf_block)) = received else {
+                    break;
+                };
+                let (l, r) = decode_one_block(&rf_block, afe_l, afe_r, disc_l, disc_r, doc_params, hs_params, params);
+                if result_tx.send((index, block, l, r)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(result_tx);
+
+        scope.spawn(move || {
+            let mut streamer = StreamingBlocks::new(reader, *layout);
+            let mut index = 0usize;
+            loop {
+                match streamer.next_block() {
+                    Ok(Some((block, rf_block))) => {
+                        if block_tx.send((index, block, rf_block)).is_err() {
+                            break; // workers gone (e.g. panicked) — stop reading
+                        }
+                        index += 1;
+                    }
+                    Ok(None) => break,
+                    Err(_) => break, // surfaced below via the collector never completing all indices; see note
+                }
+            }
+        });
+
+        // Collector: reorder by index as results arrive, trim, concatenate.
+        let mut pending: std::collections::HashMap<usize, (Block, Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+        let mut next_expected = 0usize;
+        while let Ok((index, block, l, r)) = result_rx.recv() {
+            pending.insert(index, (block, l, r));
+            while let Some((block, l, r)) = pending.remove(&next_expected) {
+                append_trimmed(&mut audio_l, &l, &block);
+                append_trimmed(&mut audio_r, &r, &block);
+                next_expected += 1;
+            }
+        }
+        // `pending` non-empty here would mean a block result never arrived
+        // for some index below `next_expected`'s ceiling — in practice
+        // unreachable: `tape_rf_io::DecodeReader` never surfaces read
+        // errors as `Err` (it logs and treats them as EOF, matching this
+        // pipeline's pre-streaming behavior), and a worker panic aborts
+        // the whole scope via `thread::scope`'s own propagation before
+        // this code runs at all. Kept as a debug assertion rather than
+        // silently ignored.
+        debug_assert!(pending.is_empty(), "block(s) {:?} never arrived in order", {
+            let mut missing: Vec<_> = pending.keys().copied().collect();
+            missing.sort_unstable();
+            missing
+        });
+    });
+
+    Ok((audio_l, audio_r))
 }
 
 fn append_trimmed(dest: &mut Vec<f32>, block_output: &[f32], block: &Block) {
@@ -171,10 +241,13 @@ fn append_trimmed(dest: &mut Vec<f32>, block_output: &[f32], block: &Block) {
     dest.extend_from_slice(&block_output[skip..skip + take]);
 }
 
-/// Decodes the whole of `rf` (one channel of raw RF samples) to a stereo
-/// (or mono, for the `l`/`r`/`sum` decode modes) pair of final-rate audio
-/// buffers.
-pub fn decode(rf: &[f32], params: &PipelineParams) -> Result<(Vec<f32>, Vec<f32>)> {
+/// Decodes the whole of `reader`'s RF input to a stereo (or mono, for the
+/// `l`/`r`/`sum` decode modes) pair of final-rate audio buffers. Streams
+/// the input (see `decode_blocks_streaming`/`crate::stream`) rather than
+/// reading it into memory upfront — the only thing this function itself
+/// holds in full is the *decoded* audio, which for even an hour-long tape
+/// is a few hundred MB, unlike the multi-tens-of-GB raw RF stream.
+pub fn decode(reader: &mut DecodeReader, params: &PipelineParams) -> Result<(Vec<f32>, Vec<f32>)> {
     if params.demod_type != DemodType::Quadrature {
         bail!("only quadrature demodulation is implemented in this port; the Hilbert path is not yet ported");
     }
@@ -202,7 +275,7 @@ pub fn decode(rf: &[f32], params: &PipelineParams) -> Result<(Vec<f32>, Vec<f32>
         .head_switching_interpolation
         .then(|| HeadswitchParams::new(AUDIO_RATE_INTERMEDIATE, hifi_decode::field_rate(params.system)));
 
-    let (audio_l, audio_r) = decode_blocks_parallel(rf, &layout, &afe_l, &afe_r, &disc_l, &disc_r, doc_params.as_ref(), hs_params.as_ref(), params);
+    let (audio_l, audio_r) = decode_blocks_streaming(reader, &layout, &afe_l, &afe_r, &disc_l, &disc_r, doc_params.as_ref(), hs_params.as_ref(), params)?;
 
     let (mut pre_l, mut pre_r) = (audio_l, audio_r);
 
