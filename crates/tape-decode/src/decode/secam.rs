@@ -49,6 +49,11 @@ fn median_of(values: &[f32]) -> f32 {
     median_from_values(&mut scratch)
 }
 
+fn median_of_f64(values: &[f64]) -> f64 {
+    let mut scratch = values.to_vec();
+    median_from_values(&mut scratch)
+}
+
 /// Raised-cosine ramp of `len` points rising from 0 (exclusive of 1).
 fn raised_cosine(len: usize) -> Vec<f64> {
     (0..len)
@@ -66,34 +71,34 @@ fn wrap_pi(angle: f64) -> f64 {
     }
 }
 
-/// The restored chroma block plus the by-products later stages reuse.
-struct RestoredChroma {
-    /// Restored chroma block signal (studio frequencies, bell-shaped).
-    restored: Vec<f32>,
-    /// Smoothed restored-domain instantaneous frequency, in Hz. Reused for line
-    /// identification.
-    inst_freq: Vec<f32>,
-    /// Band-passed under-carrier envelope, used by blanking regeneration for
-    /// local amplitude matching.
+/// The colour-under signal decomposed into per-sample phase increments plus an
+/// amplitude envelope - everything the restoration needs, and the only form in
+/// which the signal is edited.
+///
+/// Splitting the analysis out from the synthesis is what lets blanking
+/// regeneration work on the phase increments (see `patch_blanking_increments`)
+/// instead of splicing a synthesized waveform into the colour-under signal:
+/// the restored output is `bell * env * cos(mult * cumsum(increments))`, so
+/// rewriting a run of increments is a frequency edit whose phase continuity is
+/// automatic. Only this struct is expensive to build (band-pass + Hilbert over
+/// the whole field); resynthesis after an edit is O(n) arithmetic.
+struct ChromaAnalysis {
+    /// Per-sample wrapped phase increments of the colour-under carrier, rad.
+    increments: Vec<f64>,
+    /// Band-pass envelope of the colour-under carrier.
     envelope: Vec<f32>,
+    /// Absolute carrier phase at sample 0, rad.
+    phase0: f64,
 }
 
-/// Restore the studio SECAM chroma block from a method 1 colour-under signal by
-/// multiplying the carrier phase back up.
-///
-/// The divider outputs a constant-amplitude signal, so the BT.470 bell
-/// pre-emphasis is regenerated here from the restored instantaneous frequency to
-/// put the amplitude envelope back on spec for downstream SECAM decoders.
-#[allow(clippy::too_many_arguments)]
-fn upconvert_secam_method1(
+/// Band-pass the colour-under chroma and decompose it into phase increments and
+/// an amplitude envelope.
+fn analyze_under_carrier(
     chroma: &[f32],
     forward_fft: &dyn Fft<f32>,
     inverse_fft: &dyn Fft<f32>,
-    samp_rate: f64,
     under_bpf: &[Sos<f32>],
-    carrier_mult: f64,
-    rest_amplitude: f64,
-) -> RestoredChroma {
+) -> ChromaAnalysis {
     let filtered = sosfiltfilt_f32(under_bpf, chroma);
     let len = filtered.len();
 
@@ -117,10 +122,28 @@ fn upconvert_secam_method1(
         increments[0] = increments[1];
     }
 
-    // Restored instantaneous frequency for the bell shaping. Central difference
-    // plus a short moving average keeps sample-level phase noise from ending up
-    // as amplitude noise; the bell curve itself is smooth so this doesn't blunt
-    // legitimate deviation.
+    let phase0 = if len > 0 {
+        (analytic[0].im as f64).atan2(analytic[0].re as f64)
+    } else {
+        0.0
+    };
+
+    ChromaAnalysis {
+        increments,
+        envelope,
+        phase0,
+    }
+}
+
+/// Restored-domain instantaneous frequency in Hz, from the colour-under phase
+/// increments.
+///
+/// Central difference plus a short moving average keeps sample-level phase noise
+/// from ending up as amplitude noise once the bell is applied; the bell curve
+/// itself is smooth so this doesn't blunt legitimate deviation. Also the signal
+/// the line identification fit reads.
+fn restored_inst_freq(increments: &[f64], samp_rate: f64, carrier_mult: f64) -> Vec<f32> {
+    let len = increments.len();
     let freq_scale = carrier_mult * samp_rate / TAU;
     let mut raw_freq = vec![0.0f64; len];
     for i in 0..len {
@@ -162,6 +185,23 @@ fn upconvert_secam_method1(
             (window_sum / window_len as f64).clamp(SECAM_FREQ_MIN, SECAM_FREQ_MAX) as f32;
     }
 
+    inst_freq
+}
+
+/// Synthesize the studio SECAM chroma block by multiplying the colour-under
+/// carrier phase back up.
+///
+/// The divider outputs a constant-amplitude signal, so the BT.470 bell
+/// pre-emphasis is regenerated here from the restored instantaneous frequency to
+/// put the amplitude envelope back on spec for downstream SECAM decoders.
+fn synthesize_restored(
+    analysis: &ChromaAnalysis,
+    inst_freq: &[f32],
+    carrier_mult: f64,
+    rest_amplitude: f64,
+) -> Vec<f32> {
+    let len = analysis.increments.len();
+
     // Scale by the normalized under-carrier envelope (capped just above
     // nominal). Where the carrier is healthy this is ~unity, so the average
     // amplitude stays on the bell curve; where it dips or disappears (dropouts,
@@ -171,23 +211,19 @@ fn upconvert_secam_method1(
     // matters more than emulating the constant-amplitude divider chain of a real
     // deck - and it doubles as the squelch that keeps carrier-free noise from
     // becoming full-scale splatter.
-    let env_med = median_of(&envelope) as f64;
+    let env_med = median_of(&analysis.envelope) as f64;
 
     let mut restored = vec![0.0f32; len];
     // The phase is kept wrapped: cos(carrier_mult * phase) is unchanged by whole
     // turns as long as carrier_mult is an integer, and a bounded argument keeps
     // the cosine's range reduction exact over a whole field.
-    let mut phase = if len > 0 {
-        (analytic[0].im as f64).atan2(analytic[0].re as f64)
-    } else {
-        0.0
-    };
+    let mut phase = analysis.phase0;
     for i in 0..len {
         if i > 0 {
-            phase = wrap_pi(phase + increments[i]);
+            phase = wrap_pi(phase + analysis.increments[i]);
         }
         let limited = if env_med > 0.0 {
-            (envelope[i] as f64 / env_med).min(1.25)
+            (analysis.envelope[i] as f64 / env_med).min(1.25)
         } else {
             0.0
         };
@@ -195,11 +231,7 @@ fn upconvert_secam_method1(
         restored[i] = (rest_amplitude * gain * limited * (carrier_mult * phase).cos()) as f32;
     }
 
-    RestoredChroma {
-        restored,
-        inst_freq,
-        envelope,
-    }
+    restored
 }
 
 /// Fit the field's D'R/D'B line alternation from the active-region median
@@ -340,106 +372,56 @@ impl SecamParityFlywheel {
     }
 }
 
-/// A narrowband frequency/phase estimate of the colour-under carrier.
-struct CarrierFit {
-    f_rot: f64,
-    df: f64,
-    phase_mid: f64,
-    t_mid: f64,
-    samp_rate: f64,
-}
-
-impl CarrierFit {
-    /// The modelled carrier phase at absolute sample `t`.
-    fn phase_at(&self, t: f64) -> f64 {
-        TAU * (self.f_rot / self.samp_rate) * t
-            + self.phase_mid
-            + TAU * (self.df / self.samp_rate) * (t - self.t_mid)
-    }
-}
-
-/// Narrowband frequency/phase estimate of the colour-under carrier over
-/// `chroma[start..start + length]` by correlation against a rotor at `f_rot`.
-///
-/// Correlation projects out everything away from `f_rot`, so this stays usable
-/// on the raw (pre-band-pass) chroma channel where luma crosstalk would bias a
-/// broadband analytic-signal measurement. Two half-window correlations give the
-/// frequency offset from the rotor; the pooled correlation gives the phase.
-fn measure_under_carrier(
-    chroma: &[f32],
-    samp_rate: f64,
-    start: usize,
-    length: usize,
-    f_rot: f64,
-) -> Option<CarrierFit> {
-    if length == 0 || start + length > chroma.len() {
-        return None;
-    }
-    let half = length / 2;
-    if half == 0 {
-        return None;
-    }
-
-    let (mut z1_re, mut z1_im, mut z2_re, mut z2_im) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for (i, &sample) in chroma[start..start + length].iter().enumerate() {
-        let t = (start + i) as f64;
-        let (sin, cos) = (-TAU * (f_rot / samp_rate) * t).sin_cos();
-        let re = sample as f64 * cos;
-        let im = sample as f64 * sin;
-        if i < half {
-            z1_re += re;
-            z1_im += im;
-        } else {
-            z2_re += re;
-            z2_im += im;
-        }
-    }
-
-    let zf_re = z1_re + z2_re;
-    let zf_im = z1_im + z2_im;
-    if z1_re.hypot(z1_im) == 0.0 || z2_re.hypot(z2_im) == 0.0 || zf_re.hypot(zf_im) == 0.0 {
-        return None;
-    }
-
-    // angle(z2 * conj(z1))
-    let dphi = (z2_im * z1_re - z2_re * z1_im).atan2(z2_re * z1_re + z2_im * z1_im);
-    // Keep runaway estimates (no real carrier in the window) inside the format's
-    // legal deviation.
-    let df = (dphi / (TAU * half as f64 / samp_rate)).clamp(-130e3, 130e3);
-
-    Some(CarrierFit {
-        f_rot,
-        df,
-        phase_mid: zf_im.atan2(zf_re),
-        t_mid: start as f64 + (length - 1) as f64 / 2.0,
-        samp_rate,
-    })
-}
-
-/// Geometry of the synthesized blanking interval.
+/// Geometry of the regenerated blanking interval.
 mod blanking {
-    pub(super) const FADE_LEN: usize = 8;
+    /// Crossfade from the measured carrier to the outgoing rest frequency.
     pub(super) const RAMP_LEN: usize = 20;
+    /// Median window for the local carrier and amplitude estimates.
     pub(super) const MEAS_LEN: usize = 32;
     /// Rest-to-rest frequency step position within the NEXT line (px from its
     /// start): over the sync tip.
     pub(super) const STEP_START_PX: usize = 8;
     pub(super) const STEP_END_PX: usize = 40;
-    pub(super) const BUMP_END_PX: usize = 88;
-    pub(super) const BUMP_MAX_HZ: f64 = 170e3;
-    pub(super) const BUMP_TAPER: usize = 12;
+    /// How far the rewrite extends past the blanking interval at BOTH ends, to
+    /// cover the zero-phase under-carrier band-pass smearing the record chain's
+    /// transient out into active video. This is the one thing the single-pass
+    /// rewrite has to pay for that a second band-pass over a cleaned signal
+    /// would have handled for free.
+    ///
+    /// Both ends need it, and the outgoing one is not optional: the 0.85 us
+    /// `blank_start_px` already backs off only moves where the rewrite starts,
+    /// while the smear runs backwards from where the transient actually sets
+    /// in. Guarding only the incoming end leaves the local carrier estimate
+    /// reading smeared samples, which starts the front-porch ramp ~120 kHz off
+    /// and shows up as a colour band down the right edge - measured at -50 kHz
+    /// of mean bias on LAILA_9 before this was symmetric, against -7 kHz for
+    /// the two-pass implementation.
+    ///
+    /// Measured on a synthetic transient (`smear_guard_covers_the_bandpass_reach`):
+    /// the restored frequency error decays from ~122 kHz at the edge of blanking
+    /// to the band-pass ripple floor (~8 kHz) by ~17 samples, passing ~12 kHz at
+    /// 0.85 us.
+    ///
+    /// Widening this trades thin neutral strips down both edges of the picture
+    /// against tinted ones.
+    pub(super) const SMEAR_GUARD_US: f64 = 0.85;
+
+    /// `SMEAR_GUARD_US` in samples at the TBC output rate.
+    pub(super) fn smear_guard_px(samp_rate: f64) -> usize {
+        (SMEAR_GUARD_US * 1e-6 * samp_rate) as usize
+    }
 }
 
-/// Replace each line's horizontal blanking interval - front porch, sync and back
-/// porch in one continuous run - with a synthesized undeviated colour-under rest
-/// carrier, phase-continuous with the active video on both sides.
+/// Rewrite each line's horizontal blanking interval - front porch, sync and back
+/// porch in one continuous run - as an undeviated colour-under rest carrier, by
+/// replacing the measured phase increments over that run.
 ///
 /// On method 1 tapes the whole blanking interval carries the record chain's
 /// divide-by-4 counter settling transient (blanking edges / SECAM subcarrier
 /// phase reversals upset the divider), not the undeviated reference BT.470
 /// promises. Two things go wrong if it is left in place:
 ///
-/// - the zero-phase filters in this chain (the under-carrier band-pass here,
+/// - the zero-phase filters in this chain (the under-carrier band-pass, and
 ///   `chroma_filter_final` later) and the linear-phase cloche filters in
 ///   downstream SECAM decoders smear the end-of-line transient BACKWARDS into
 ///   the last ~2 us of active video, which demodulates as a magenta band down
@@ -449,23 +431,26 @@ mod blanking {
 ///   the back porch, and transient energy ringing into that window biases the
 ///   zeros, which shows up as a full-field colour cast.
 ///
-/// This runs in the colour-under domain BEFORE the band-pass/analytic-signal
-/// restoration pass, so the zero-phase filtering never sees the transient. One
-/// continuous synthesis per blanking interval, phase-aligned to the outgoing
-/// active carrier at its start and the incoming one at its end, with no interior
-/// splices.
+/// Because the restored output is the cosine of the running sum of these
+/// increments, rewriting a run of them is purely a frequency edit: the phase is
+/// continuous by construction at both boundaries, with nothing to measure and
+/// nothing to close. The synthesized profile ramps from the local measured
+/// carrier to the outgoing line's rest frequency across the front porch, steps
+/// to the incoming line's rest over the sync tip, and holds it through the back
+/// porch, where downstream decoders take their discriminator-zero reference.
+/// The envelope is ramped between the two neighbouring levels over the same run
+/// so the amplitude carries no step either.
 ///
-/// The synthesized frequency ramps from the measured outgoing carrier to the
-/// outgoing line's rest frequency across the front porch, steps to the incoming
-/// line's rest over the sync tip, and holds it through the back porch and the
-/// fade-out; the phase is the integral of that profile, so it is continuous
-/// throughout. The random phase difference between the two lines' carriers is
-/// closed by a frequency bump over the sync region plus a small constant offset
-/// across the hold.
+/// The rewrite shifts the absolute carrier phase of everything after it, which
+/// is immaterial: SECAM is FM, and only the instantaneous frequency survives
+/// into the picture.
+///
+/// Each line's run reads only active video either side of itself and writes only
+/// its own blanking interval, so the runs neither overlap nor observe each
+/// other: the loop is order-independent.
 #[allow(clippy::too_many_arguments)]
-fn regenerate_secam_blanking(
-    chroma: &[f32],
-    envelope: &[f32],
+fn patch_blanking_increments(
+    analysis: &mut ChromaAnalysis,
     samp_rate: f64,
     linesout: usize,
     outwidth: usize,
@@ -474,157 +459,88 @@ fn regenerate_secam_blanking(
     first_line: usize,
     dr_on_even: bool,
     carrier_mult: f64,
-) -> Vec<f32> {
+) {
     use blanking::*;
 
-    let mut cleaned = chroma.to_vec();
-    let fade = raised_cosine(FADE_LEN);
+    let len = analysis.increments.len();
+    let guard = smear_guard_px(samp_rate);
     let ramp = raised_cosine(RAMP_LEN);
     let step_len = STEP_END_PX - STEP_START_PX;
     let mid_step = raised_cosine(step_len);
-    let taper = raised_cosine(BUMP_TAPER);
+    if blank_start_px >= outwidth || blank_start_px < guard {
+        return;
+    }
+    // Offset of the next line's start within the rewritten run.
+    let next_line_p = outwidth - blank_start_px + guard;
 
     for linenumber in first_line..linesout.saturating_sub(1) {
         let line_is_dr = linenumber.is_multiple_of(2) == dr_on_even;
-        let f_out_rest = if line_is_dr { SECAM_FOR } else { SECAM_FOB } / carrier_mult;
-        let f_in_rest = if line_is_dr { SECAM_FOB } else { SECAM_FOR } / carrier_mult;
-        let start = linenumber * outwidth + blank_start_px;
-        let end = (linenumber + 1) * outwidth + porch_end_px;
+        let f_out_rest = if line_is_dr { SECAM_FOR } else { SECAM_FOB };
+        let f_in_rest = if line_is_dr { SECAM_FOB } else { SECAM_FOR };
+        // Colour-under phase advance per sample at each rest carrier.
+        let inc_out_rest = TAU * f_out_rest / (carrier_mult * samp_rate);
+        let inc_in_rest = TAU * f_in_rest / (carrier_mult * samp_rate);
+
+        // The run is widened by the smear guard at both ends, so the local
+        // estimates below read active video the transient has not reached.
+        let start = linenumber * outwidth + blank_start_px - guard;
+        let end = (linenumber + 1) * outwidth + porch_end_px + guard;
         if end <= start {
             continue;
         }
         let span = end - start;
-        if start < 2 * MEAS_LEN + FADE_LEN || end + 2 * MEAS_LEN > cleaned.len() {
+        // Room for both median windows outside the run, and for the profile
+        // inside it.
+        if start < 2 * MEAS_LEN || end + 2 * MEAS_LEN > len {
             continue;
         }
-        // Enough room for both ramps, the step and the phase-closure hold.
-        if span < 2 * RAMP_LEN + 96 || porch_end_px >= span {
+        if span < RAMP_LEN + step_len + 2 * MEAS_LEN || next_line_p >= span {
             continue;
         }
 
-        let Some(out_meas) =
-            measure_under_carrier(&cleaned, samp_rate, start - MEAS_LEN, MEAS_LEN, f_out_rest)
-        else {
-            continue;
-        };
-        let Some(in_meas) = measure_under_carrier(&cleaned, samp_rate, end, MEAS_LEN, f_in_rest)
-        else {
-            continue;
-        };
-        let f_out = out_meas.f_rot + out_meas.df;
+        // Local carrier and amplitude, from medians just outside the run.
+        // Narrow enough to track the picture at the end of the line, wide
+        // enough not to be moved by per-sample phase noise.
+        let inc_out = median_of_f64(&analysis.increments[start - MEAS_LEN..start]);
+        let amp_out = median_of(&analysis.envelope[start - 2 * MEAS_LEN..start - MEAS_LEN]) as f64;
+        let amp_in = median_of(&analysis.envelope[end + MEAS_LEN..end + 2 * MEAS_LEN]) as f64;
 
-        // Local amplitudes from the band-passed envelope: narrowband correlation
-        // under-reads a deviating FM carrier, and an amplitude step at the
-        // splice would read as a click downstream. Measured a little away from
-        // the splice points, where the pass-1 envelope is still inflated by the
-        // band-pass smear of the adjacent transient.
-        let amp_out = median_of(&envelope[start - 2 * MEAS_LEN..start - MEAS_LEN]) as f64;
-        let amp_in = median_of(&envelope[end + MEAS_LEN..end + 2 * MEAS_LEN]) as f64;
+        let step0 = (next_line_p + STEP_START_PX)
+            .max(RAMP_LEN)
+            .min(span - step_len);
+        let step1 = step0 + step_len;
 
         // Frequency profile: measured outgoing -> outgoing rest (over the front
         // porch) -> incoming rest (step over the sync tip) -> incoming rest held
-        // through the back porch, all raised-cosine.
-        let next_line_p = span - porch_end_px; // px offset of the next line start
-        let step0 = (next_line_p + STEP_START_PX)
-            .max(RAMP_LEN)
-            .min(span - RAMP_LEN - 96);
-        let step1 = step0 + step_len;
-        if step1 > span {
-            continue;
-        }
-
-        // The write extends FADE_LEN beyond `start` on the outside, so the
-        // fade-in sits OVER the phase-matched measured outgoing carrier (before
-        // the transient sets in) instead of over raw transient next to the
-        // picture. The incoming side gets NO fade at all: the synth ends
-        // phase-closed against the incoming carrier model at `end`, and the raw
-        // signal takes over with its natural continuity.
-        let q = FADE_LEN; // profile offset of `start`
-        let span_ext = span + FADE_LEN;
-        let mut f_prof = vec![0.0f64; span_ext];
-        f_prof[..q].fill(f_out);
+        // through the back porch. Raised-cosine throughout, so the restored
+        // instantaneous frequency has no step anywhere.
+        //
+        // No crossfade back on the incoming side: the run ends inside active
+        // video, where the measured increments are already the picture's own,
+        // and the 9-tap smoothing in `restored_inst_freq` blends the handover.
+        let profile = &mut analysis.increments[start..end];
         for (i, &value) in ramp.iter().enumerate() {
-            f_prof[q + i] = f_out + (f_out_rest - f_out) * value;
+            profile[i] = inc_out + (inc_out_rest - inc_out) * value;
         }
-        f_prof[q + RAMP_LEN..q + step0].fill(f_out_rest);
+        profile[RAMP_LEN..step0].fill(inc_out_rest);
         for (i, &value) in mid_step.iter().enumerate() {
-            f_prof[q + step0 + i] = f_out_rest + (f_in_rest - f_out_rest) * value;
+            profile[step0 + i] = inc_out_rest + (inc_in_rest - inc_out_rest) * value;
         }
-        // Rest frequency holds right through the back porch AND the fade-out:
-        // the porch is the decoders' discriminator-zero reference, and the
-        // undeviated carrier is also zero colour difference, so the fade-out
-        // region decodes as neutral instead of as a per-line click.
-        f_prof[q + step1..].fill(f_in_rest);
+        profile[step1..].fill(inc_in_rest);
 
-        let phase_start = out_meas.phase_at(start as f64 - q as f64);
-        let integrate = |profile: &[f64]| -> Vec<f64> {
-            let mut phase = Vec::with_capacity(profile.len());
-            let mut acc = 0.0f64;
-            for &value in profile {
-                phase.push(phase_start + TAU * acc / samp_rate);
-                acc += value;
-            }
-            phase
-        };
-
-        let phase = integrate(&f_prof);
-        let phase_at_end = phase[span_ext - 1] + TAU * f_prof[span_ext - 1] / samp_rate;
-        let err = wrap_pi(in_meas.phase_at(end as f64) - phase_at_end);
-
-        // Flat-top frequency excursion over the sync region: area = absorbed
-        // phase. Starts no earlier than just before the next line (its band-pass
-        // ring must stay out of the outgoing picture) and ends early enough that
-        // the ring stays out of the porch reference window. Any spill past the
-        // cap becomes a constant offset across the rest-frequency hold - never
-        // more than a few kHz, too small to bias the per-field porch cluster
-        // medians or flip a line identity label.
-        let b0 = (RAMP_LEN + 4).max(next_line_p.saturating_sub(16));
-        let b1 = (next_line_p + BUMP_END_PX).min(span - RAMP_LEN - 4);
-        let hold_end = span - RAMP_LEN;
-        if b1 <= b0 || b1 - b0 < 2 * BUMP_TAPER + 8 || b1 >= hold_end {
-            continue;
-        }
-        let hold_len = hold_end - b1;
-        if hold_len < 24 {
-            continue;
-        }
-
-        let bump_len = b1 - b0;
-        let bump_area = (bump_len - BUMP_TAPER) as f64; // amplitude * samples
-        let bump_capacity = TAU * BUMP_MAX_HZ * bump_area / samp_rate;
-        let err_bump = err.clamp(-bump_capacity, bump_capacity);
-        let bump_amp = err_bump * samp_rate / (TAU * bump_area);
-        for i in 0..bump_len {
-            let shape = if i < BUMP_TAPER {
-                taper[i]
-            } else if i >= bump_len - BUMP_TAPER {
-                taper[bump_len - 1 - i]
-            } else {
-                1.0
-            };
-            f_prof[q + b0 + i] += bump_amp * shape;
-        }
-        // Constant-offset spill over the rest-frequency hold (usually zero).
-        let hold_offset = (err - err_bump) * samp_rate / (TAU * hold_len as f64);
-        for value in &mut f_prof[q + b1..q + hold_end] {
-            *value += hold_offset;
-        }
-
-        let phase = integrate(&f_prof);
-        let amp_step = if span_ext > 1 {
-            (amp_in - amp_out) / (span_ext - 1) as f64
+        // Amplitude ramp across the run: an envelope step at either boundary
+        // would read as a click downstream. Measured a little away from the
+        // boundaries, where the band-pass smear of the transient still inflates
+        // the envelope.
+        let amp_step = if span > 1 {
+            (amp_in - amp_out) / (span - 1) as f64
         } else {
             0.0
         };
-        for (i, &phase_value) in phase.iter().enumerate() {
-            let synth = (amp_out + amp_step * i as f64) * phase_value.cos();
-            let blend = if i < FADE_LEN { fade[i] } else { 1.0 };
-            let target = &mut cleaned[start - q + i];
-            *target = (*target as f64 * (1.0 - blend) + synth * blend) as f32;
+        for (i, sample) in analysis.envelope[start..end].iter_mut().enumerate() {
+            *sample = (amp_out + amp_step * i as f64) as f32;
         }
     }
-
-    cleaned
 }
 
 /// Per-decode SECAM state carried across fields.
@@ -672,17 +588,16 @@ pub(crate) fn process_chroma_secam_method1(
     let burst_abs_ref = spec.sys_burst_abs_ref.context("missing burst_abs_ref")? as f64;
     let rest_amplitude = burst_abs_ref * std::f64::consts::SQRT_2;
 
-    let forward_fft = spec.fft_field_forward_f32.as_ref();
-    let inverse_fft = spec.fft_field_inverse_f32.as_ref();
-    let mut pass = upconvert_secam_method1(
+    // The one expensive step: band-pass plus Hilbert over the whole field. The
+    // blanking rewrite below edits its output in place, so this runs once even
+    // though the restoration is resynthesized afterwards.
+    let mut analysis = analyze_under_carrier(
         chroma,
-        forward_fft,
-        inverse_fft,
-        samp_rate,
+        spec.fft_field_forward_f32.as_ref(),
+        spec.fft_field_inverse_f32.as_ref(),
         under_bpf,
-        carrier_mult,
-        rest_amplitude,
     );
+    let mut inst_freq = restored_inst_freq(&analysis.increments, samp_rate, carrier_mult);
 
     // This port has no per-line colour-killer signal, so the first usable line is
     // simply the end of the vertical interval.
@@ -691,28 +606,17 @@ pub(crate) fn process_chroma_secam_method1(
 
     // Give downstream decoders the undeviated blanking-interval reference the
     // standard promises them; what comes off tape there is the record divider's
-    // settling transient (see `regenerate_secam_blanking`). This is a two-pass
-    // restore: the first pass above identifies the lines, then the blanking is
-    // replaced in the colour-under domain and the restoration is run again on
-    // the cleaned signal, so the zero-phase filtering never gets to smear the
-    // transient into the picture or the porch reference.
-    let fit = fit_secam_line_alternation(
-        &pass.inst_freq,
-        linesout,
-        outwidth,
-        first_line,
-        porch_end_px,
-    );
+    // settling transient (see `patch_blanking_increments`).
+    let fit = fit_secam_line_alternation(&inst_freq, linesout, outwidth, first_line, porch_end_px);
     let (dr_on_even, parity_source) = state.flywheel.resolve(field.readloc, fit);
 
     if let Some(dr_on_even) = dr_on_even {
         // The record chain's blanking-edge transient sets in slightly before the
         // nominal end of active video (the source's own blanking edge lands
-        // inside the TBC active window), so the splice starts a little early.
+        // inside the TBC active window), so the rewrite starts a little early.
         let blank_start_px = ((spec.sys_active_video_us[1] - 0.85) * spec.sys_outfreq) as usize;
-        let cleaned = regenerate_secam_blanking(
-            chroma,
-            &pass.envelope,
+        patch_blanking_increments(
+            &mut analysis,
             samp_rate,
             linesout,
             outwidth,
@@ -722,15 +626,7 @@ pub(crate) fn process_chroma_secam_method1(
             dr_on_even,
             carrier_mult,
         );
-        pass = upconvert_secam_method1(
-            &cleaned,
-            forward_fft,
-            inverse_fft,
-            samp_rate,
-            under_bpf,
-            carrier_mult,
-            rest_amplitude,
-        );
+        inst_freq = restored_inst_freq(&analysis.increments, samp_rate, carrier_mult);
         tracing::debug!(
             "SECAM blanking reference regenerated ({}, fit confidence {})",
             parity_source.as_str(),
@@ -745,7 +641,7 @@ pub(crate) fn process_chroma_secam_method1(
         );
     }
 
-    let mut uphet = pass.restored;
+    let mut uphet = synthesize_restored(&analysis, &inst_freq, carrier_mult, rest_amplitude);
     uphet.truncate(linesout * outwidth);
 
     // Block-anchored final band-pass (same band as ME-SECAM).
@@ -799,6 +695,8 @@ mod tests {
     const TEST_PORCH_END_PX: usize = 186;
     const TEST_BLANK_START_PX: usize = 1093;
     const CARRIER_MULT: f64 = 4.0;
+    /// `blanking::smear_guard_px` at the test rate: 0.85 us -> 15 samples.
+    const TEST_GUARD_PX: usize = 15;
 
     fn under_bandpass() -> Vec<Sos<f32>> {
         let half = TEST_SAMP_RATE / 2.0;
@@ -808,20 +706,25 @@ mod tests {
         )
     }
 
-    /// Run the restoration over a buffer, planning FFTs to match its length.
-    fn restore(chroma: &[f32], rest_amplitude: f64) -> RestoredChroma {
+    fn analyze(chroma: &[f32]) -> ChromaAnalysis {
         let mut planner = FftPlanner::<f32>::new();
         let forward = planner.plan_fft_forward(chroma.len());
         let inverse = planner.plan_fft_inverse(chroma.len());
-        upconvert_secam_method1(
+        analyze_under_carrier(
             chroma,
             forward.as_ref(),
             inverse.as_ref(),
-            TEST_SAMP_RATE,
             &under_bandpass(),
-            CARRIER_MULT,
-            rest_amplitude,
         )
+    }
+
+    /// Run the whole restoration over a buffer, planning FFTs to match its
+    /// length.
+    fn restore(chroma: &[f32], rest_amplitude: f64) -> (Vec<f32>, Vec<f32>) {
+        let analysis = analyze(chroma);
+        let inst_freq = restored_inst_freq(&analysis.increments, TEST_SAMP_RATE, CARRIER_MULT);
+        let restored = synthesize_restored(&analysis, &inst_freq, CARRIER_MULT, rest_amplitude);
+        (inst_freq, restored)
     }
 
     /// Constant-amplitude colour-under tone at `under_freq`.
@@ -837,9 +740,9 @@ mod tests {
         // playback has to bring both back up by the same factor.
         for deviation in [0.0, 100e3, -100e3, 200e3] {
             let restored_freq = SECAM_FOR + deviation;
-            let pass = restore(&under_tone(16384, restored_freq / CARRIER_MULT), 1.0);
+            let (inst_freq, _) = restore(&under_tone(16384, restored_freq / CARRIER_MULT), 1.0);
             // Skip the filter transients at both ends.
-            let mut middle = pass.inst_freq[4096..12288].to_vec();
+            let mut middle = inst_freq[4096..12288].to_vec();
             let measured = median_from_values(&mut middle) as f64;
             assert!(
                 (measured - restored_freq).abs() < 1e3,
@@ -850,13 +753,13 @@ mod tests {
 
     #[test]
     fn x4_restores_the_blue_rest_carrier_too() {
-        let pass = restore(&under_tone(16384, SECAM_FOB / CARRIER_MULT), 1.0);
-        let mut middle = pass.inst_freq[4096..12288].to_vec();
+        let (inst_freq, _) = restore(&under_tone(16384, SECAM_FOB / CARRIER_MULT), 1.0);
+        let mut middle = inst_freq[4096..12288].to_vec();
         let measured = median_from_values(&mut middle) as f64;
         assert!((measured - SECAM_FOB).abs() < 1e3, "measured {measured} Hz");
         // The two rest carriers must stay 156.25 kHz apart after restoration.
-        let red = restore(&under_tone(16384, SECAM_FOR / CARRIER_MULT), 1.0);
-        let mut red_middle = red.inst_freq[4096..12288].to_vec();
+        let (red_freq, _) = restore(&under_tone(16384, SECAM_FOR / CARRIER_MULT), 1.0);
+        let mut red_middle = red_freq[4096..12288].to_vec();
         let red_measured = median_from_values(&mut red_middle) as f64;
         assert!(((red_measured - measured) - (SECAM_FOR - SECAM_FOB)).abs() < 1e3);
     }
@@ -867,11 +770,11 @@ mod tests {
         // to carry the BT.470 bell envelope again.
         const REST_AMPLITUDE: f64 = 7071.0;
         for restored_freq in [SECAM_FOR, SECAM_FOB, SECAM_FOR + 200e3] {
-            let pass = restore(
+            let (_, restored) = restore(
                 &under_tone(16384, restored_freq / CARRIER_MULT),
                 REST_AMPLITUDE,
             );
-            let peak = pass.restored[4096..12288]
+            let peak = restored[4096..12288]
                 .iter()
                 .fold(0.0f32, |acc, &value| acc.max(value.abs())) as f64;
             let expected = REST_AMPLITUDE * secam_bell_gain(restored_freq);
@@ -901,16 +804,11 @@ mod tests {
         signal
     }
 
-    #[test]
-    fn blanking_regeneration_restores_the_porch_reference() {
-        let linesout = 8usize;
-        let dr_on_even = true;
-        let chroma = field_with_blanking_transient(linesout, dr_on_even);
-        let envelope = vec![1.0f32; chroma.len()];
-
-        let cleaned = regenerate_secam_blanking(
-            &chroma,
-            &envelope,
+    /// Analyze a synthetic field and rewrite its blanking intervals.
+    fn analyze_and_patch(chroma: &[f32], linesout: usize, dr_on_even: bool) -> ChromaAnalysis {
+        let mut analysis = analyze(chroma);
+        patch_blanking_increments(
+            &mut analysis,
             TEST_SAMP_RATE,
             linesout,
             TEST_OUTWIDTH,
@@ -920,92 +818,158 @@ mod tests {
             dr_on_even,
             CARRIER_MULT,
         );
+        analysis
+    }
+
+    #[test]
+    fn blanking_patch_restores_the_porch_reference() {
+        let linesout = 8usize;
+        let dr_on_even = true;
+        let chroma = field_with_blanking_transient(linesout, dr_on_even);
+
+        let before = restored_inst_freq(&analyze(&chroma).increments, TEST_SAMP_RATE, CARRIER_MULT);
+        let patched = analyze_and_patch(&chroma, linesout, dr_on_even);
+        let after = restored_inst_freq(&patched.increments, TEST_SAMP_RATE, CARRIER_MULT);
 
         // Decoders calibrate their discriminator zeros from roughly 65..5 px
         // before active video. That window must now sit on the incoming line's
-        // rest carrier.
+        // rest carrier, in the restored domain.
         for line in 3..linesout {
             let line_is_dr = line.is_multiple_of(2) == dr_on_even;
-            let rest = if line_is_dr { SECAM_FOR } else { SECAM_FOB } / CARRIER_MULT;
-            let window_start = line * TEST_OUTWIDTH + TEST_PORCH_END_PX - 62;
-            let before = measure_under_carrier(&chroma, TEST_SAMP_RATE, window_start, 32, rest)
-                .expect("porch fit before");
-            let after = measure_under_carrier(&cleaned, TEST_SAMP_RATE, window_start, 32, rest)
-                .expect("porch fit after");
+            let rest = if line_is_dr { SECAM_FOR } else { SECAM_FOB };
+            let window = line * TEST_OUTWIDTH + TEST_PORCH_END_PX - 65
+                ..line * TEST_OUTWIDTH + TEST_PORCH_END_PX - 5;
+
+            let mut before_window = before[window.clone()].to_vec();
+            let before_median = median_from_values(&mut before_window) as f64;
+            let mut after_window = after[window].to_vec();
+            let after_median = median_from_values(&mut after_window) as f64;
+
             assert!(
-                before.df.abs() > 40e3,
-                "line {line}: transient should be present before regeneration ({} Hz)",
-                before.df
+                (before_median - rest).abs() > 150e3,
+                "line {line}: transient should be present before the rewrite ({before_median} Hz)",
             );
             assert!(
-                after.df.abs() < 4e3,
-                "line {line}: porch off rest by {} Hz after regeneration",
-                after.df
+                (after_median - rest).abs() < 20e3,
+                "line {line}: porch off rest by {} Hz after the rewrite",
+                after_median - rest
             );
         }
     }
 
     #[test]
-    fn blanking_regeneration_leaves_active_video_alone() {
+    fn blanking_patch_leaves_active_video_alone() {
         let linesout = 8usize;
         let chroma = field_with_blanking_transient(linesout, true);
-        let envelope = vec![1.0f32; chroma.len()];
-        let cleaned = regenerate_secam_blanking(
-            &chroma,
-            &envelope,
-            TEST_SAMP_RATE,
-            linesout,
-            TEST_OUTWIDTH,
-            TEST_BLANK_START_PX,
-            TEST_PORCH_END_PX,
-            1,
-            true,
-            CARRIER_MULT,
-        );
+        let before = analyze(&chroma);
+        let after = analyze_and_patch(&chroma, linesout, true);
 
-        // The synthesis writes from FADE_LEN before `blank_start_px` up to
-        // `porch_end_px` of the next line, and must not touch a sample of the
-        // picture beyond that.
+        // The rewrite spans from `blank_start_px` to `porch_end_px` of the next
+        // line, widened by the smear guard at both ends, and must not touch a
+        // sample of the picture beyond that - increments or envelope.
         for line in 2..linesout - 1 {
             let base = line * TEST_OUTWIDTH;
-            for pos in TEST_PORCH_END_PX..TEST_BLANK_START_PX - blanking::FADE_LEN {
+            for pos in TEST_PORCH_END_PX + TEST_GUARD_PX..TEST_BLANK_START_PX - TEST_GUARD_PX {
                 assert_eq!(
-                    chroma[base + pos],
-                    cleaned[base + pos],
-                    "line {line} pos {pos} inside active video was modified"
+                    before.increments[base + pos],
+                    after.increments[base + pos],
+                    "line {line} pos {pos}: active video increment was modified"
+                );
+                assert_eq!(
+                    before.envelope[base + pos],
+                    after.envelope[base + pos],
+                    "line {line} pos {pos}: active video envelope was modified"
                 );
             }
         }
     }
 
     #[test]
-    fn blanking_regeneration_stays_phase_continuous() {
+    fn smear_guard_covers_the_bandpass_reach() {
+        // The single-pass rewrite leaves the zero-phase under-carrier band-pass
+        // to smear the tail of the transient forward into active video, so the
+        // guard has to outrun it. Measured on the UNPATCHED analysis as the
+        // restored-domain error against each line's own rest carrier.
+        let linesout = 8usize;
+        let dr_on_even = true;
+        let chroma = field_with_blanking_transient(linesout, dr_on_even);
+        let inst_freq =
+            restored_inst_freq(&analyze(&chroma).increments, TEST_SAMP_RATE, CARRIER_MULT);
+
+        let worst_at = |offset: usize| -> f64 {
+            (2..linesout - 1)
+                .map(|line| {
+                    let line_is_dr = line.is_multiple_of(2) == dr_on_even;
+                    let rest = if line_is_dr { SECAM_FOR } else { SECAM_FOB };
+                    let i = line * TEST_OUTWIDTH + TEST_PORCH_END_PX + offset;
+                    (inst_freq[i] as f64 - rest).abs()
+                })
+                .fold(0.0f64, f64::max)
+        };
+
+        // At the nominal end of blanking the smear is still most of the
+        // transient; by the guard it has decayed to the band-pass ripple floor.
+        assert!(
+            worst_at(0) > 100e3,
+            "smear at the blanking edge is only {} Hz - the test signal is wrong",
+            worst_at(0)
+        );
+        assert!(
+            worst_at(TEST_GUARD_PX) < 12e3,
+            "smear is still {} Hz at the guard ({TEST_GUARD_PX} px); widen SMEAR_GUARD_US",
+            worst_at(TEST_GUARD_PX)
+        );
+    }
+
+    #[test]
+    fn blanking_patch_introduces_no_frequency_step() {
+        // Phase continuity is automatic in the increments domain, so what has to
+        // be checked is that the rewrite leaves no step in the restored
+        // instantaneous frequency at either boundary or across the profile.
         let linesout = 8usize;
         let chroma = field_with_blanking_transient(linesout, true);
-        let envelope = vec![1.0f32; chroma.len()];
-        let cleaned = regenerate_secam_blanking(
-            &chroma,
-            &envelope,
-            TEST_SAMP_RATE,
-            linesout,
-            TEST_OUTWIDTH,
-            TEST_BLANK_START_PX,
-            TEST_PORCH_END_PX,
-            1,
-            true,
-            CARRIER_MULT,
-        );
+        let patched = analyze_and_patch(&chroma, linesout, true);
+        let inst_freq = restored_inst_freq(&patched.increments, TEST_SAMP_RATE, CARRIER_MULT);
 
-        // A splice discontinuity would show up as a sample-to-sample step far
-        // larger than the carrier's own per-sample excursion. The under carrier
-        // advances at most ~0.4 rad per sample, so a unit-amplitude tone never
-        // steps by more than ~0.4.
-        let start = 2 * TEST_OUTWIDTH;
-        let max_step = cleaned[start..]
+        // Scan the region the rewrite actually covers: from line 2 to the end of
+        // the last rewritten run. Beyond it lie the final line's own blanking
+        // interval (never rewritten - the run needs a next line) and the
+        // band-pass edge transient at the end of the buffer, both of which carry
+        // the raw transient by design.
+        let scan =
+            2 * TEST_OUTWIDTH..(linesout - 1) * TEST_OUTWIDTH + TEST_PORCH_END_PX + TEST_GUARD_PX;
+
+        // The steepest intended feature is the rest-to-rest step: 156.25 kHz
+        // raised-cosine over 32 samples, so ~7.7 kHz per sample at its centre.
+        let max_step = inst_freq[scan]
             .windows(2)
             .map(|pair| (pair[1] - pair[0]).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_step < 0.5, "largest sample step {max_step}");
+        assert!(max_step < 12e3, "largest frequency step {max_step} Hz");
+    }
+
+    #[test]
+    fn blanking_patch_keeps_the_envelope_continuous() {
+        let linesout = 8usize;
+        let chroma = field_with_blanking_transient(linesout, true);
+        let patched = analyze_and_patch(&chroma, linesout, true);
+
+        // A step in the envelope at a rewrite boundary would read as a click
+        // downstream. The synthetic field has a flat envelope, so any step here
+        // is one the rewrite introduced. Same scan bounds as the frequency
+        // check: past the last rewritten run sit the final line's raw blanking
+        // and the buffer-edge transient.
+        let scan =
+            2 * TEST_OUTWIDTH..(linesout - 1) * TEST_OUTWIDTH + TEST_PORCH_END_PX + TEST_GUARD_PX;
+        let reference = median_of(&patched.envelope[scan.clone()]) as f64;
+        let max_step = patched.envelope[scan]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0f32, f32::max) as f64;
+        assert!(
+            max_step < 0.05 * reference,
+            "largest envelope step {max_step} against a level of {reference}"
+        );
     }
 
     #[test]
@@ -1036,6 +1000,7 @@ mod tests {
         assert_eq!(median_of(&[3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median_of(&[4.0, 1.0, 3.0, 2.0]), 2.5);
         assert!(median_of(&[]).is_nan());
+        assert_eq!(median_of_f64(&[3.0, 1.0, 2.0]), 2.0);
     }
 
     #[test]
@@ -1088,31 +1053,6 @@ mod tests {
         let (parity, source) = flywheel.resolve(0, Some((true, 0.5)));
         assert_eq!(parity, None);
         assert_eq!(source, ParitySource::Unlocked);
-    }
-
-    #[test]
-    fn carrier_measurement_recovers_frequency_and_phase() {
-        let samp_rate = 17_734_375.0;
-        let f_true = 1_082_031.25 + 20_000.0;
-        let phase0 = 0.7;
-        let start = 1000usize;
-        let length = 32usize;
-        let signal: Vec<f32> = (0..start + length + 16)
-            .map(|t| (TAU * f_true * t as f64 / samp_rate + phase0).cos() as f32)
-            .collect();
-
-        let fit = measure_under_carrier(&signal, samp_rate, start, length, 1_082_031.25)
-            .expect("carrier fit");
-        assert!(
-            ((fit.f_rot + fit.df) - f_true).abs() < 1500.0,
-            "measured {} vs {f_true}",
-            fit.f_rot + fit.df
-        );
-        // The modelled phase must track the real carrier across the window.
-        for t in [start, start + length / 2, start + length - 1] {
-            let expected = TAU * f_true * t as f64 / samp_rate + phase0;
-            assert!(wrap_pi(fit.phase_at(t as f64) - expected).abs() < 0.05);
-        }
     }
 
     #[test]
