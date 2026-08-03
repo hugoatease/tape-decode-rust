@@ -276,6 +276,7 @@ dependencies = [
  "rubato",
  "sci-rs",
  "serde",
+ "serde_json",
  "tape-dsp",
  "tracing",
 ]

@@ -11,3 +11,6 @@ sci-rs = "0.4"
 serde = { version = "1", features = ["derive"] }
 tape-dsp = { path = "../tape-dsp" }
 tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"

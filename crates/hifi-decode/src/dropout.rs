@@ -32,7 +32,7 @@ pub fn cancel_dc_trim(audio: &mut [f32], trim: usize) -> f32 {
     dc
 }
 
-fn mean_stddev(signal: &[f32]) -> (f64, f64) {
+pub(crate) fn mean_stddev(signal: &[f32]) -> (f64, f64) {
     let mean = signal.iter().map(|&v| v as f64).sum::<f64>() / signal.len() as f64;
     let variance = signal.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / signal.len() as f64;
     (mean, variance.sqrt())
@@ -40,7 +40,7 @@ fn mean_stddev(signal: &[f32]) -> (f64, f64) {
 
 /// `merge_boundaries` (`HiFiDecode.py:1719-1730`): sort by start, then
 /// merge any overlapping/touching `[start, end)` ranges.
-fn merge_boundaries(mut boundaries: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn merge_boundaries(mut boundaries: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     boundaries.sort_by_key(|&(start, _)| start);
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in boundaries {
