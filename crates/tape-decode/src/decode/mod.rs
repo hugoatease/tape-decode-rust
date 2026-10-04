@@ -1618,6 +1618,7 @@ impl Decoder {
         let system = match (spec.sys_frame_lines, spec.color_system) {
             (LineSystem::Line525, ColorSystem::Pal) => "PAL-M",
             (LineSystem::Line525, _) => "NTSC",
+            (_, ColorSystem::Secam) => "SECAM",
             _ => "PAL",
         };
         Some(DecoderMetadata {
