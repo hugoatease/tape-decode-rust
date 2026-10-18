@@ -2122,7 +2122,7 @@ fn findpulses_arr_reduced(
 fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f32, new_blank: f32) -> bool {
     let blank_sync_ire_diff = (new_blank - new_sync) / ctx.sp_hz_ire;
 
-    if (ctx.sp_vsync_hz - new_sync) > (ctx.sp_hz_ire * 15.0) || blank_sync_ire_diff > 47.0 {
+    if (ctx.sp_vsync_hz - new_sync) > (ctx.sp_hz_ire * 25.0) || blank_sync_ire_diff > 47.0 {
         return false;
     }
     if new_sync - ctx.sp_vsync_hz < (ctx.sp_hz_ire * 5.0) {
@@ -2590,8 +2590,8 @@ impl ResyncState {
                     tracing::debug!(
                         "Level check failed on serration measured levels, using defaults."
                     );
-                    sync = ctx.sp_ire0;
-                    blank = ctx.sp_vsync_hz;
+                    sync = ctx.sp_vsync_hz;
+                    blank = ctx.sp_ire0;
                 }
             } else {
                 let (s, b) = self.field_state.pull_levels();
