@@ -1863,9 +1863,10 @@ fn vsyncserration_search_eq_pulses(
     let eq_s = sync_pulses[where_min_diff[0]] as usize;
     let eq_e = ((sync_pulses[*where_min_diff.last().unwrap()] as f64) + (eq_pulselen as f64 / 2.0))
         as usize;
-    let eq_e = eq_e.min(data.len() - 1);
     let data_s = eq_s + start;
-    let data_e = eq_e + start;
+    // eq_e is relative to min_block; clamp in data coordinates (Python slicing
+    // silently truncates here).
+    let data_e = (eq_e + start).min(data.len());
     let serration = &data[data_s..data_e];
 
     if !(vbi_time_range_min < serration.len() as f64
