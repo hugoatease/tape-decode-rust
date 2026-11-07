@@ -129,6 +129,29 @@ tape-decode decode \
   capture.u8
 ```
 
+**Decode a PAL Video8 tape captured with an unmodified CXADC (28.636 MHz)**
+
+```bash
+tape-decode decode \
+  --luma-out decoded.tbc \
+  --chroma-out decoded_chroma.tbc \
+  --metadata-out decoded.tbc.json \
+  --profile PAL_VIDEO8 \
+  --frequency 8fsc \
+  --input-format flac \
+  capture.flac
+```
+
+`--frequency` is required by `decode` and `scan`: the sample rate stored in a capture's
+FLAC header is whatever the capture script wrote (often `40000`), not necessarily the rate
+the card ran at, and a wrong value skews every duration and the decoder's line timing.
+Besides plain numbers (MHz), it accepts `Hz`/`k`/`M`/`G` suffixes and colour-subcarrier
+multiples: `8fsc` is 28.636 MHz (CXADC), `4fscpal` is 17.734 MHz.
+
+FLAC captures longer than 2^36 samples (about 40 minutes at 28.6 MHz) are read correctly
+even when the encoder wrapped the length in the header: tape-decode ignores the declared
+total and finds the end of the file from the frames themselves.
+
 **Livestream 40 MHz PAL VHS from `/dev/cxadc0`**
 
 ```bash

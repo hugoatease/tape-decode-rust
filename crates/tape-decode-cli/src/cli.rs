@@ -136,7 +136,8 @@ struct DecodeArgs {
     /// Path to a profile to load instead of an embedded profile.
     #[arg(long, alias = "profile_file")]
     profile_file: Option<PathBuf>,
-    /// Input RF sample rate in MHz; Hz, kHz, MHz, M, and k suffixes are accepted.
+    /// Input RF sample rate in MHz (required); Hz, kHz, MHz, GHz, M, k and g suffixes
+    /// are accepted, as are `fsc` and `fscpal` multiples (`8fsc` = 28.636 MHz).
     #[arg(long, value_parser = parse_frequency)]
     frequency: Option<f64>,
     /// Input sample offset to seek before decoding.
@@ -350,7 +351,8 @@ struct ScanArgs {
     /// Path to a profile to load instead of an embedded profile.
     #[arg(long, alias = "profile_file")]
     profile_file: Option<PathBuf>,
-    /// Input RF sample rate in MHz; Hz, kHz, MHz, M, and k suffixes are accepted.
+    /// Input RF sample rate in MHz (required); Hz, kHz, MHz, GHz, M, k and g suffixes
+    /// are accepted, as are `fsc` and `fscpal` multiples (`8fsc` = 28.636 MHz).
     #[arg(long, value_parser = parse_frequency)]
     frequency: Option<f64>,
     /// Input format.
@@ -395,7 +397,8 @@ struct TrimArgs {
     /// Path to a profile to load instead of an embedded profile.
     #[arg(long, alias = "profile_file")]
     profile_file: Option<PathBuf>,
-    /// Input RF sample rate in MHz; Hz, kHz, MHz, M, and k suffixes are accepted.
+    /// Input RF sample rate in MHz; defaults to the FLAC header rate when that is an
+    /// RF rate. Same suffixes as `decode` (`8fsc` = 28.636 MHz).
     #[arg(long, value_parser = parse_frequency)]
     frequency: Option<f64>,
     /// Margin kept around the recorded span with --auto, seconds.
@@ -451,6 +454,18 @@ fn parse_tape_time(value: &str) -> Result<f64> {
     Ok(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
+/// Resolve a mandatory `--frequency` (in MHz) for commands that cannot trust
+/// the FLAC header: capture tools write a fixed rate there (e.g. 40000 for a
+/// CXADC that really runs at 28.636 MHz), and guessing wrong skews every
+/// duration and the decoder's line timing without any error.
+fn require_frequency(frequency: Option<f64>) -> Result<f64> {
+    frequency.context(
+        "--frequency is required: the sample rate in the FLAC header is not reliable for RF \
+         captures. Use the rate the capture card really ran at, e.g. --frequency 8fsc (or \
+         28.636) for an unmodified CXADC, --frequency 40 for a Domesday Duplicator or MISRC",
+    )
+}
+
 fn parse_frequency(value: &str) -> Result<f64> {
     let value = value.trim();
     let suffix_start = value
@@ -460,8 +475,13 @@ fn parse_frequency(value: &str) -> Result<f64> {
     let base = number.parse::<f64>().context("invalid frequency value")?;
     let multiplier = match suffix.to_ascii_lowercase().as_str() {
         "" | "m" | "mhz" => 1.0,
+        "g" | "ghz" => 1.0e3,
         "k" | "khz" => 1.0e-3,
         "hz" => 1.0e-6,
+        // Multiples of the colour subcarriers: 315/88 MHz (NTSC) and
+        // 283.75 * 15625 + 25 Hz (PAL), so an unmodified CXADC is `8fsc`.
+        "fsc" => 315.0 / 88.0,
+        "fscpal" => (283.75 * 15625.0 + 25.0) / 1.0e6,
         _ => bail!("unknown frequency suffix: {suffix}"),
     };
     Ok(base * multiplier)
@@ -495,7 +515,7 @@ fn run_scan(cli: ScanArgs) -> Result<()> {
         _ => bail!("exactly one of --profile or --profile-file is required"),
     };
     let params = crate::scan::ScanParams {
-        sample_rate_hz: cli.frequency.unwrap_or(40.0) * 1.0e6,
+        sample_rate_hz: require_frequency(cli.frequency)? * 1.0e6,
         stride_secs: cli.stride,
         min_event_secs: cli.min_event,
         margin_secs: cli.margin,
@@ -636,7 +656,7 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         _ => bail!("exactly one of --profile or --profile-file is required"),
     };
     let request = DecodeRequest {
-        inputfreq: cli.frequency.unwrap_or(40.0),
+        inputfreq: require_frequency(cli.frequency)?,
 
         chroma_trap: cli.chroma_trap,
         sharpness: cli.sharpness,
@@ -1280,5 +1300,50 @@ fn report_json(candidate: &Path, total_errors: usize, errors: &[String], failed:
             eprintln!("  {error}");
         }
         *failed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(value: &str) -> f64 {
+        parse_frequency(value).unwrap()
+    }
+
+    #[test]
+    fn bare_number_is_mhz() {
+        assert_eq!(parse("40"), 40.0);
+        assert_eq!(parse(" 28.636 "), 28.636);
+    }
+
+    #[test]
+    fn decimal_suffixes_scale_to_mhz() {
+        assert_eq!(parse("1ghz"), 1000.0);
+        assert_eq!(parse("40MHz"), 40.0);
+        assert_eq!(parse("40M"), 40.0);
+        assert_eq!(parse("40000khz"), 40.0);
+        assert_eq!(parse("40000000hz"), 40.0);
+    }
+
+    #[test]
+    fn subcarrier_suffixes() {
+        assert!((parse("1fsc") - 3.579_545_454_545).abs() < 1e-9);
+        assert!((parse("8fsc") - 28.636_363_636_363).abs() < 1e-9);
+        assert_eq!(parse("1fscpal"), 4.433_618_75);
+        assert_eq!(parse("4fscpal"), 4.433_618_75 * 4.0);
+    }
+
+    #[test]
+    fn unknown_suffix_is_rejected() {
+        assert!(parse_frequency("28foo").is_err());
+        assert!(parse_frequency("fsc").is_err());
+    }
+
+    #[test]
+    fn frequency_is_mandatory_for_scan_and_decode() {
+        let err = require_frequency(None).unwrap_err().to_string();
+        assert!(err.contains("--frequency is required"), "{err}");
+        assert_eq!(require_frequency(Some(28.636)).unwrap(), 28.636);
     }
 }
