@@ -77,7 +77,10 @@ impl RawFlacReader {
             .read(true)
             .open(path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mss = MediaSourceStream::new(
+            crate::flac::hide_total_samples(Box::new(file)),
+            Default::default(),
+        );
         let reader =
             FlacReader::try_new(mss, FormatOptions::default()).context("failed to read FLAC")?;
         let (track_id, params) = {
@@ -780,6 +783,128 @@ mod tests {
             err.to_string().contains("30 samples"),
             "unexpected error: {err}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    /// Overwrites the 36-bit `total_samples` of a finished file, the way a
+    /// capture longer than 2^36 samples ends up with a wrapped (too short)
+    /// length from ffmpeg.
+    fn forge_declared_length(path: &Path, total: u64) {
+        assert!(total <= MAX_DECLARABLE_SAMPLES);
+        let mut bytes = std::fs::read(path).expect("read flac");
+        let packed = u64::from_be_bytes(bytes[18..26].try_into().unwrap());
+        let packed = (packed & !MAX_DECLARABLE_SAMPLES) | total;
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+        std::fs::write(path, bytes).expect("write flac");
+        assert_eq!(declared_length_of(path), total);
+    }
+
+    fn expected_sample(i: u64) -> i32 {
+        (i % 61) as i32 - 30
+    }
+
+    /// A wrapped `total_samples` made symphonia reject every seek beyond it,
+    /// so `scan` believed a 2.5 h capture ended after 40 minutes.
+    #[test]
+    fn seeks_past_a_wrapped_declared_length() {
+        const FRAMES: u64 = BLOCK_SIZE as u64 * 8;
+        const TARGET: u64 = BLOCK_SIZE as u64 * 7 + 13;
+        let dir = scratch_dir("wrapped-seek");
+        let input = dir.join("in.flac");
+        write_input(&input, FRAMES);
+        forge_declared_length(&input, 1000);
+
+        // The sample-source path used by `scan` and `decode`.
+        let file = std::fs::File::open(&input).expect("open");
+        let mut source =
+            crate::reader::open_source(file, crate::reader::SampleFormat::Flac).expect("source");
+        source.seek_samples(TARGET).expect("seek past declared length");
+        let mut out = vec![0f32; 50];
+        assert_eq!(source.read(&mut out).expect("read"), 50);
+        for (k, got) in out.iter().enumerate() {
+            let want = expected_sample(TARGET + k as u64) as f32 / 128.0;
+            assert_eq!(*got, want, "sample {k} after the seek");
+        }
+        // Seeking backwards and reading the true end still works.
+        source.seek_samples(FRAMES - 10).expect("seek near the end");
+        assert_eq!(source.read(&mut out).expect("read"), 10);
+        assert!(source.seek_samples(FRAMES + BLOCK_SIZE as u64).is_err());
+
+        // The bit-exact reader used by `trim`.
+        let mut reader = RawFlacReader::open(&input).expect("open reader");
+        reader.seek_to(TARGET).expect("seek");
+        let mut frames = Vec::new();
+        assert_eq!(reader.read_frames(&mut frames, 50), 50);
+        for (k, got) in frames.iter().enumerate() {
+            assert_eq!(*got, expected_sample(TARGET + k as u64), "sample {k}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `cut_flac` must reach past the wrapped length too, and still write the
+    /// exact length of what it kept.
+    #[test]
+    fn cut_past_a_wrapped_declared_length() {
+        const FRAMES: u64 = BLOCK_SIZE as u64 * 8;
+        let dir = scratch_dir("wrapped-cut");
+        let (input, output) = (dir.join("in.flac"), dir.join("out.flac"));
+        write_input(&input, FRAMES);
+        forge_declared_length(&input, 1000);
+
+        let start = BLOCK_SIZE as u64 * 5;
+        let stats = cut_flac(&input, &output, start, Some(FRAMES), true).expect("cut");
+        assert_eq!(stats.frames_written, FRAMES - start);
+        assert_eq!(declared_length_of(&output), FRAMES - start);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Only a STREAMINFO-led FLAC is patched; the rest of the stream, and a
+    /// file whose declared length is right, are untouched.
+    #[test]
+    fn hiding_the_length_leaves_everything_else_alone() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        const FRAMES: u64 = BLOCK_SIZE as u64 * 2;
+        let dir = scratch_dir("hide-passthrough");
+        let input = dir.join("in.flac");
+        write_input(&input, FRAMES);
+        let original = std::fs::read(&input).expect("read");
+
+        let file = std::fs::File::open(&input).expect("open");
+        let mut hidden = crate::flac::hide_total_samples(Box::new(file));
+        let mut seen = Vec::new();
+        hidden.read_to_end(&mut seen).expect("read");
+        assert_eq!(seen.len(), original.len());
+        assert_eq!(&seen[..18], &original[..18]);
+        assert_eq!(seen[21] & 0xf0, original[21] & 0xf0, "rate/bits nibble kept");
+        assert_eq!(seen[21] & 0x0f, 0);
+        assert_eq!(&seen[22..26], &[0, 0, 0, 0]);
+        assert_eq!(&seen[26..], &original[26..]);
+
+        // Seeking back into the patched prefix and out of it stays coherent.
+        hidden.seek(SeekFrom::Start(20)).expect("seek");
+        let mut again = vec![0u8; 20];
+        hidden.read_exact(&mut again).expect("read");
+        assert_eq!(&again[..2], &original[20..22].iter().enumerate()
+            .map(|(i, b)| if i == 1 { b & 0xf0 } else { *b }).collect::<Vec<_>>()[..]);
+        assert_eq!(&again[2..6], &[0, 0, 0, 0]);
+        assert_eq!(&again[6..], &original[26..40]);
+        hidden.seek(SeekFrom::Current(-4)).expect("relative seek");
+        let mut tail = [0u8; 4];
+        hidden.read_exact(&mut tail).expect("read");
+        assert_eq!(&tail, &original[36..40]);
+
+        // Not a FLAC: passed through byte for byte.
+        let other = dir.join("other.bin");
+        let junk: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        std::fs::write(&other, &junk).expect("write");
+        let mut hidden =
+            crate::flac::hide_total_samples(Box::new(std::fs::File::open(&other).expect("open")));
+        let mut seen = Vec::new();
+        hidden.read_to_end(&mut seen).expect("read");
+        assert_eq!(seen, junk);
 
         std::fs::remove_dir_all(&dir).ok();
     }

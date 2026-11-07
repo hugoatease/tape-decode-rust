@@ -3,6 +3,13 @@
 //! samples are normalized to ~[-1, 1], so a 16-bit FLAC reads identically to the
 //! equivalent raw `s16` capture. File-backed input seeks via
 //! symphonia's binary search; stdin can only skip forward by decoding.
+//!
+//! The STREAMINFO `total_samples` field is never handed to symphonia (see
+//! [`hide_total_samples`]): it is only 36 bits wide, so long RF captures wrap it
+//! (ffmpeg truncates it modulo 2^36 instead of writing 0), and symphonia
+//! rejects any seek beyond the declared length.
+
+use std::io::{self, Read, Seek, SeekFrom};
 
 use anyhow::{bail, Context as _, Result};
 use symphonia_bundle_flac::{FlacDecoder, FlacReader};
@@ -18,7 +25,113 @@ use crate::reader::SampleSource;
 /// Decode `source` (a seekable file or a forward-only pipe) as a FLAC sample
 /// source.
 pub fn open(source: Box<dyn MediaSource>) -> Result<Box<dyn SampleSource>> {
-    Ok(Box::new(FlacSource::new(source)?))
+    Ok(Box::new(FlacSource::new(hide_total_samples(source))?))
+}
+
+/// Bytes of a native FLAC stream needed to cover the STREAMINFO `total_samples`
+/// field: `fLaC` (4), block header (4), then 18 bytes of STREAMINFO up to and
+/// including the last byte of `total_samples`.
+const STREAMINFO_PREFIX_LEN: usize = 26;
+/// `total_samples` is 36 bits: the low nibble of byte 21, then bytes 22..26.
+const TOTAL_SAMPLES_HIGH_NIBBLE_BYTE: usize = 21;
+
+/// Wrap `source` so that a FLAC STREAMINFO `total_samples` reads as 0 ("unknown").
+///
+/// The field is 36 bits wide (about 68.7 G samples, 40 minutes at 28.6 MSps).
+/// Longer captures wrap: ffmpeg writes the length modulo 2^36, which looks like
+/// a valid but far too short length, and symphonia then refuses every seek
+/// beyond it. With the field hidden, symphonia binary-searches the frame
+/// headers instead, exactly as it does for files that declare 0.
+///
+/// Anything that does not start with a `fLaC` marker followed by a STREAMINFO
+/// block is passed through untouched.
+pub(crate) fn hide_total_samples(source: Box<dyn MediaSource>) -> Box<dyn MediaSource> {
+    Box::new(HideTotalSamples::new(source))
+}
+
+struct HideTotalSamples {
+    inner: Box<dyn MediaSource>,
+    /// The first bytes of the stream, with `total_samples` already zeroed.
+    prefix: Vec<u8>,
+    /// Absolute position of the next byte `read` returns.
+    pos: u64,
+}
+
+impl HideTotalSamples {
+    fn new(mut inner: Box<dyn MediaSource>) -> Self {
+        let mut prefix = vec![0u8; STREAMINFO_PREFIX_LEN];
+        let mut got = 0;
+        // A failed or short read just means there is nothing to patch; the
+        // bytes already read are still replayed from `prefix`.
+        while got < prefix.len() {
+            match inner.read(&mut prefix[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        prefix.truncate(got);
+        if prefix.len() == STREAMINFO_PREFIX_LEN
+            && &prefix[..4] == b"fLaC"
+            && prefix[4] & 0x7f == 0
+        {
+            prefix[TOTAL_SAMPLES_HIGH_NIBBLE_BYTE] &= 0xf0;
+            prefix[TOTAL_SAMPLES_HIGH_NIBBLE_BYTE + 1..].fill(0);
+        }
+        Self {
+            inner,
+            prefix,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for HideTotalSamples {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.prefix.len() as u64 {
+            let start = self.pos as usize;
+            let n = buf.len().min(self.prefix.len() - start);
+            buf[..n].copy_from_slice(&self.prefix[start..start + n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for HideTotalSamples {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        // `inner` sits at the end of the prefix while `pos` is inside it, so a
+        // relative seek must be turned into an absolute one first.
+        let to = match to {
+            SeekFrom::Current(offset) => {
+                let target = self.pos.checked_add_signed(offset).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before start of stream")
+                })?;
+                SeekFrom::Start(target)
+            }
+            other => other,
+        };
+        let target = self.inner.seek(to)?;
+        self.pos = target;
+        if target < self.prefix.len() as u64 {
+            // Reads in the prefix are served from memory; keep `inner` aligned
+            // with the first byte after it.
+            self.inner.seek(SeekFrom::Start(self.prefix.len() as u64))?;
+        }
+        Ok(target)
+    }
+}
+
+impl MediaSource for HideTotalSamples {
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.inner.byte_len()
+    }
 }
 
 struct FlacSource {
